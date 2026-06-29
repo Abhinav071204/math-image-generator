@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from docx import Document
 from docx.shared import Inches
+from lxml import etree
 
 # ============================================================
 # PAGE CONFIG
@@ -32,7 +33,7 @@ st.markdown("""
 STYLE_RULES = {
     'graphs': {
         'axis_pad_units'   : 0.5,
-        'line_width_pt'    : 1.0,
+        'line_width_pt'    : 1.5,   # thicker so lines are visible
         'gridline_width_pt': 0.5,
         'gridline_color'   : '#cccccc',
     },
@@ -83,13 +84,17 @@ def resolve_font(grade_band):
 
 def detect_prompt_type(prompt):
     p = prompt.lower()
-    if re.search(r'scatter|plot\s+[a-d]\s+points?|2x2|four\s+(scatter|plot)', p):
+    # Scatter: explicit keyword OR any "Plot X:" / "Plot X points" pattern
+    if re.search(r'scatter|2x2|four\s+(scatter|plot)', p):
+        return 'scatter_grid'
+    if re.search(r'\bplot\s+[a-z0-9]\s*[:\-]|\bplot\s+[a-z0-9]\s+points?', p, re.I):
         return 'scatter_grid'
     if re.search(r'coordinate\s+plane|passes?\s+through|passing\s+through|goes?\s+through|intersect|y\s*=|slope|line', p):
         return 'line_graph'
     return 'unknown'
 
 def parse_line_prompt(prompt):
+    # Normalise dashes and unicode minus
     p = prompt
     for ch in ['−', '–', '—', '\u2212', '\u2013', '\u2014']:
         p = p.replace(ch, '-')
@@ -129,6 +134,28 @@ def parse_line_prompt(prompt):
         s = (y2 - y1) / (x2 - x1)
         return s, y1 - s * x1
 
+    # ----------------------------------------------------------------
+    # FIX 1: also parse equations like y = 2x + 1 directly,
+    # not just from coordinate pairs
+    # ----------------------------------------------------------------
+    def parse_equation(text):
+        """Return (slope, intercept) from 'y = mx + b' style strings, or None."""
+        text = text.replace(' ', '').lower()
+        # y = mx + b
+        m = re.match(r'y=(-?\d*\.?\d*)x([+-]\d+\.?\d*)?$', text)
+        if m:
+            coef = m.group(1)
+            if coef in ('', '+'):   slope = 1.0
+            elif coef == '-':       slope = -1.0
+            else:                   slope = float(coef)
+            intercept = float(m.group(2)) if m.group(2) else 0.0
+            return slope, intercept
+        # y = b  (horizontal line)
+        m = re.match(r'y=(-?\d+\.?\d*)$', text)
+        if m:
+            return 0.0, float(m.group(1))
+        return None
+
     block_spans = [m.start() for m in re.finditer(
         r'Dataset\s+\d+[^\n]*?:|Line\s+[A-Z]\s*:|(?:the\s+)?line\s+y\s*=', p, re.I)]
     blocks = []
@@ -164,22 +191,43 @@ def parse_line_prompt(prompt):
 
     lines_found = []
     for block in blocks:
-        pairs = extract_coord_pairs(block)
-        if len(pairs) < 2: continue
-        x1, y1 = pairs[0]
-        x2, y2 = pairs[1]
-        x1, y1, x2, y2 = (int(v) if v == int(v) else v for v in (x1, y1, x2, y2))
-        s, b  = pts_to_slope(x1, y1, x2, y2)
-        name  = extract_name(block)
-        style = extract_style(block) or 'solid'
-        lines_found.append({
-            'equation'      : name if name else 'line',
-            'slope'         : s,
-            'intercept'     : b,
-            'points'        : [(x1, y1), (x2, y2)],
-            'linestyle'     : linestyles_map.get(style, '-'),
-            'style_explicit': extract_style(block) is not None,
-        })
+        pairs  = extract_coord_pairs(block)
+        s_name = extract_name(block)
+        style  = extract_style(block) or 'solid'
+
+        if len(pairs) >= 2:
+            x1, y1 = pairs[0]
+            x2, y2 = pairs[1]
+            x1, y1, x2, y2 = (int(v) if v == int(v) else v for v in (x1, y1, x2, y2))
+            sl, b  = pts_to_slope(x1, y1, x2, y2)
+            lines_found.append({
+                'equation'      : s_name if s_name else 'line',
+                'slope'         : sl,
+                'intercept'     : b,
+                'points'        : [(x1, y1), (x2, y2)],
+                'linestyle'     : linestyles_map.get(style, '-'),
+                'style_explicit': extract_style(block) is not None,
+            })
+        else:
+            # FIX 1b: fall back to equation parsing when fewer than 2 coord pairs
+            eq_m = re.search(r'y\s*=\s*(-?\s*\d*\.?\d*\s*x\s*(?:[+\-]\s*\d+\.?\d*)?|-?\d+\.?\d*)', block, re.I)
+            if eq_m:
+                result = parse_equation(eq_m.group(0))
+                if result:
+                    sl, b = result
+                    # Generate two display points from the equation
+                    x_lo = params['x_min']
+                    x_hi = params['x_max']
+                    pt1  = (int(x_lo), int(sl*x_lo + b) if (sl*x_lo+b) == int(sl*x_lo+b) else sl*x_lo+b)
+                    pt2  = (int(x_hi), int(sl*x_hi + b) if (sl*x_hi+b) == int(sl*x_hi+b) else sl*x_hi+b)
+                    lines_found.append({
+                        'equation'      : s_name if s_name else eq_m.group(0).strip(),
+                        'slope'         : sl,
+                        'intercept'     : b,
+                        'points'        : [pt1, pt2],
+                        'linestyle'     : linestyles_map.get(style, '-'),
+                        'style_explicit': extract_style(block) is not None,
+                    })
 
     ds = get_dataset_styles(len(lines_found), params['color_mode'])
     for idx, line in enumerate(lines_found):
@@ -214,31 +262,34 @@ def parse_scatter_prompt(prompt):
     yr = re.search(r'(?:y-axis|vertical\s+axis)[^.]*?from\s+(-?\d+(?:\.\d+)?)\s+to\s+(-?\d+(?:\.\d+)?)', p, re.I)
     if xr:
         params['x_min'], params['x_max'] = float(xr.group(1)), float(xr.group(2))
-    else:
-        ranges = re.findall(r'(\d+(?:\.\d+)?)\s+to\s+(\d+(?:\.\d+)?)', p)
-        if ranges: params['x_max'] = float(ranges[0][1])
     if yr:
         params['y_min'], params['y_max'] = float(yr.group(1)), float(yr.group(2))
-    else:
-        ranges = re.findall(r'(\d+(?:\.\d+)?)\s+to\s+(\d+(?:\.\d+)?)', p)
-        if len(ranges) >= 2: params['y_max'] = float(ranges[1][1])
 
-    plot_starts = [(m.group(1).upper(), m.start()) for m in re.finditer(r'Plot\s+([A-Za-z0-9])\b', p, re.I)]
+    # ----------------------------------------------------------------
+    # FIX 2: more robust scatter parser — handles both
+    #   "Plot A: (1,2), (3,4)" and "Plot A points 1,2,3,4"
+    # ----------------------------------------------------------------
+    plot_starts = [(m.group(1).upper(), m.start()) for m in re.finditer(r'\bPlot\s+([A-Za-z0-9])\b', p, re.I)]
     plots = {}
     for i, (label, start) in enumerate(plot_starts):
         end   = plot_starts[i + 1][1] if i + 1 < len(plot_starts) else len(p)
         block = p[start:end]
+
+        # First preference: explicit (x,y) pairs
         paren_pts = re.findall(r'\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)', block)
         if paren_pts:
             pts = [(float(x), float(y)) for x, y in paren_pts]
         else:
-            m = re.search(r'points?\s+([\d.,\s\-]+?)(?:—|--|\u2014|\.\s|\.$|$)', block, re.I)
+            # Second preference: flat number list "points 1,2,3,4 …"
+            m = re.search(r'points?\s*([\d.,\s\-]+)', block, re.I)
             pts = []
             if m:
                 nums = [float(n) for n in re.findall(r'-?\d+(?:\.\d+)?', m.group(1))]
                 pts  = list(zip(nums[0::2], nums[1::2]))
+
         if pts:
-            plots[label] = [(int(x) if x == int(x) else x, int(y) if y == int(y) else y) for x, y in pts]
+            plots[label] = [(int(x) if x == int(x) else x,
+                             int(y) if y == int(y) else y) for x, y in pts]
     params['plots'] = plots
     return params
 
@@ -294,7 +345,10 @@ def generate_line_image(params):
     for idx, line in enumerate(params['lines']):
         if line['slope'] is None: continue
         y_vals = line['slope'] * x_full + line['intercept']
-        ax.plot(x_full, y_vals, color=line['color'],
+        # FIX: clip y values to plot range so lines extend fully across the axes
+        mask   = (y_vals >= yp_min) & (y_vals <= yp_max)
+        ax.plot(x_full[mask], y_vals[mask],
+                color=line['color'],
                 linewidth=STYLE_RULES['graphs']['line_width_pt'],
                 linestyle=line['linestyle'], label=line['equation'], zorder=2)
         for pidx, (xi, yi) in enumerate(line['points']):
@@ -348,7 +402,10 @@ def generate_scatter_grid(params):
         xs = [p[0] for p in points]
         ys = [p[1] for p in points]
         color = style[0] if color_mode == 'color' else 'black'
-        ax.scatter(xs, ys, color=color, marker='+', s=80, linewidths=1.2, zorder=3)
+        # FIX 2b: use visible markers with clear borders
+        ax.scatter(xs, ys, color=color, marker='o', s=60,
+                   edgecolors='black' if color_mode != 'color' else color,
+                   linewidths=0.8, zorder=3)
         ax.grid(True, linestyle='--', linewidth=0.5, color='#cccccc', alpha=0.7)
         px_max = max(params['x_max'], max(xs)+2) if xs else params['x_max']
         py_max = max(params['y_max'], max(ys)+2) if ys else params['y_max']
@@ -361,7 +418,7 @@ def generate_scatter_grid(params):
         ax.spines['right'].set_visible(False)
         ax.set_xlabel(params['x_label'], fontsize=9, labelpad=4)
         ax.set_ylabel(params['y_label'], fontsize=9, labelpad=4)
-        ax.set_title(label, fontsize=14, fontweight='bold', loc='left', pad=8)
+        ax.set_title(f'Plot {label}', fontsize=14, fontweight='bold', loc='left', pad=8)
     for i in range(len(labels), len(axes_flat)):
         axes_flat[i].set_visible(False)
     buf = io.BytesIO()
@@ -378,7 +435,7 @@ def render_image(params, img_type):
 
 
 # ============================================================
-# DOCX HELPERS
+# DOCX HELPERS — FIX 3: robust placeholder replacement
 # ============================================================
 def extract_full_text(para):
     parts = []
@@ -401,14 +458,49 @@ def find_image_placeholders(doc):
     return found
 
 def replace_placeholder(doc, para_index, img_bytes):
+    """
+    FIX 3: Completely replace the target paragraph's XML with a fresh <w:p>
+    containing only the image run.  This avoids left-over runs and broken
+    element trees that occurred when we tried to mutate the paragraph in-place.
+    """
+    from docx.oxml.ns import qn
+    from docx.oxml   import OxmlElement
+    from copy        import deepcopy
+
     para   = doc.paragraphs[para_index]
     p_elem = para._element
-    for child in list(p_elem):
-        tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
-        if tag != 'pPr':
-            p_elem.remove(child)
-    run = para.add_run()
-    run.add_picture(img_bytes, width=Inches(5.5))
+
+    # Save paragraph properties (pPr) if present
+    pPr = p_elem.find(qn('w:pPr'))
+    pPr_copy = deepcopy(pPr) if pPr is not None else None
+
+    # Build a brand-new <w:p> element
+    new_p = OxmlElement('w:p')
+    if pPr_copy is not None:
+        new_p.append(pPr_copy)
+
+    # Create a run and embed the picture
+    new_r = OxmlElement('w:r')
+    new_p.append(new_r)
+
+    # Use python-docx's internal picture machinery on a temp paragraph,
+    # then steal the drawing XML from it
+    tmp_para = doc.add_paragraph()           # appended at end of doc
+    tmp_run  = tmp_para.add_run()
+    img_bytes.seek(0)
+    tmp_run.add_picture(img_bytes, width=Inches(5.5))
+
+    # The drawing element is inside the run of tmp_para
+    drawing = tmp_para._element.find('.//' + qn('w:drawing'))
+    if drawing is not None:
+        new_r.append(deepcopy(drawing))
+
+    # Remove the temporary paragraph we used as a staging area
+    tmp_para._element.getparent().remove(tmp_para._element)
+
+    # Replace the old paragraph element in the document body
+    p_elem.getparent().replace(p_elem, new_p)
+
 
 def process_doc_bytes(doc_bytes):
     """Process a .docx bytes blob. Returns (updated_doc_bytes, results_list)."""
@@ -436,11 +528,13 @@ def process_doc_bytes(doc_bytes):
             entry['error'] = str(e)
         results.append(entry)
 
-    # Embed images
-    for r in results:
+    # Embed images — process in REVERSE index order so replacements don't
+    # shift the paragraph indices of later items
+    for r in sorted(results, key=lambda x: x['para_index'], reverse=True):
         if r['img_buf'] and not r['error']:
             r['img_buf'].seek(0)
             replace_placeholder(doc, r['para_index'], r['img_buf'])
+
     out = io.BytesIO()
     doc.save(out)
     out.seek(0)
@@ -520,7 +614,7 @@ with st.sidebar:
         st.caption('🔒 Never stored or logged.')
 
     st.markdown('---')
-    st.caption('Graph generation is 100% free — runs entirely on the server with no external APIs.')
+    st.caption('Graph generation runs entirely on the server — free, no external APIs.')
 
 
 # ============================================================
@@ -528,9 +622,44 @@ with st.sidebar:
 # ============================================================
 if '📄 Single' in mode:
     st.title('📐 Math Image Generator')
-    st.markdown('Upload a `.docx`, select a placeholder, paste the prompt → get the image embedded.')
-    st.markdown('---')
 
+    # ---- Plain-English How-To ----
+    with st.expander('📖 How to use this app (click to open)', expanded=False):
+        st.markdown("""
+**Step-by-step guide:**
+
+1. **Prepare your Word document (.docx)**
+   - Wherever you want a graph to appear, type this on its own line:
+     ```
+     Image (if any): <your graph description here>
+     ```
+   - Example: `Image (if any): the line y = 2x + 1, passing through (0,1) and (2,5)`
+
+2. **Upload your document** using the "Upload .docx" button below.
+
+3. **Select the placeholder** — the app will detect all `Image (if any):` lines and list them in a dropdown.
+
+4. **Paste your graph description** into the "Image prompt" box (you can copy it from the document).
+
+5. **Click "Generate Image"** — a preview appears on the right.
+
+6. **Download** either:
+   - Just the image (PNG file), or
+   - The full updated document (with the image embedded in place of the placeholder)
+
+---
+**What kinds of graphs work?**
+
+| Graph type | Example prompt |
+|---|---|
+| Line graph | `the line y = 2x + 1, passing through (0,1) and (2,5)` |
+| Multiple lines | `Line A: (0,1) and (2,5) (solid). Line B: (0,3) and (4,3) (dashed).` |
+| Scatter plots | `Plot A: (1,2), (3,4), (5,6). Plot B: (2,5), (4,8).` |
+
+**Color vs grayscale?** Add `grade 3-5` or `elementary` in your prompt for color; `grade 6-8` or `grade 9-12` for grayscale.
+        """)
+
+    st.markdown('---')
     col1, col2 = st.columns([1, 1])
 
     with col1:
@@ -544,30 +673,33 @@ if '📄 Single' in mode:
             if placeholders:
                 st.success(f'✅ Found {len(placeholders)} placeholder(s)')
             else:
-                st.warning('No `Image (if any):` placeholders found.')
+                st.warning('No `Image (if any):` placeholders found in this document.')
 
         st.subheader('2 — Select Placeholder')
         selected_idx = None
         if placeholders:
             selected_idx = st.selectbox(
-                'Placeholder',
+                'Choose a placeholder to fill',
                 options=range(len(placeholders)),
-                format_func=lambda i: f"[{placeholders[i]['para_index']}] {placeholders[i]['text'][:70]}..."
+                format_func=lambda i: f"[Para {placeholders[i]['para_index']}] {placeholders[i]['text'][:70]}..."
             )
         else:
             st.info('Upload a document to see placeholders.')
 
         st.subheader('3 — Paste Prompt')
-        prompt = st.text_area('Image prompt', height=180,
-                               placeholder='Paste the image prompt text here...')
+        prompt = st.text_area(
+            'Graph description',
+            height=180,
+            placeholder='Example: the line y = 2x + 1, passing through (0,1) and (2,5), x-axis from 0 to 6, y-axis from 0 to 12'
+        )
 
     with col2:
         st.subheader('Preview & Download')
         if st.button('▶️ Generate Image', type='primary', use_container_width=True):
             if not uploaded:
-                st.error('Upload a .docx first.')
+                st.error('Please upload a .docx file first.')
             elif not prompt.strip():
-                st.error('Paste a prompt.')
+                st.error('Please paste a graph description in the box on the left.')
             elif selected_idx is None:
                 st.error('No placeholder selected.')
             else:
@@ -577,14 +709,26 @@ if '📄 Single' in mode:
                         st.info(f'Detected type: **{img_type}**')
 
                         if img_type == 'line_graph' and (not params or not params.get('lines')):
-                            st.error('No lines found. Check the prompt has coordinate pairs like (0,1) and (2,5).')
+                            st.error(
+                                '⚠️ No lines found in your prompt.\n\n'
+                                'Make sure it includes either:\n'
+                                '- An equation like `y = 2x + 1`, or\n'
+                                '- Two coordinate points like `(0,1)` and `(2,5)`'
+                            )
                         elif img_type == 'scatter_grid' and (not params or not params.get('plots')):
-                            st.error('No scatter data found.')
+                            st.error(
+                                '⚠️ No scatter data found.\n\n'
+                                'Your prompt should include sections like:\n'
+                                '`Plot A: (1,2), (3,4), (5,6)`'
+                            )
                         elif img_type not in ('line_graph', 'scatter_grid'):
-                            st.error('Could not detect graph type from the prompt.')
+                            st.error(
+                                '⚠️ Could not figure out what type of graph to draw.\n\n'
+                                'Try including words like "line", "y =", "scatter", or "Plot A" in your description.'
+                            )
                         else:
                             img_buf = render_image(params, img_type)
-                            st.image(img_buf, caption='Generated image', use_container_width=True)
+                            st.image(img_buf, caption='Generated graph', use_container_width=True)
 
                             # Build updated doc
                             img_buf.seek(0)
@@ -604,9 +748,9 @@ if '📄 Single' in mode:
                                                file_name='output_with_image.docx',
                                                mime='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
                                                use_container_width=True)
-                            st.success('✅ Done!')
+                            st.success('✅ Done! Download your files above.')
                     except Exception as e:
-                        st.error(f'Error: {e}')
+                        st.error(f'Something went wrong: {e}')
                         import traceback; st.code(traceback.format_exc())
 
 
@@ -615,28 +759,49 @@ if '📄 Single' in mode:
 # ============================================================
 else:
     st.title('📁 Batch Mode — Google Drive')
-    st.markdown(
-        'Point the app at a Drive folder → processes every `.docx`, '
-        'embeds graphs, and gives you a **ZIP file to download** with all updated documents + images.'
-    )
-    st.markdown('---')
 
-    folder_url = st.text_input('🔗 Google Drive Folder Link',
-                                placeholder='https://drive.google.com/drive/folders/XXXXXXXXXX')
+    with st.expander('📖 How to use Batch Mode (click to open)', expanded=False):
+        st.markdown("""
+**What this does:** Automatically processes an entire folder of Word documents from Google Drive,
+embeds graphs into each one, and lets you download all updated files in a single ZIP file.
+
+**Setup (one-time):**
+1. Go to [Google Cloud Console](https://console.cloud.google.com) and enable the **Google Drive API**.
+2. Create a **Service Account** and download the JSON key file.
+3. **Share your Drive folder** with the service account email (give it **Editor** access).
+4. Paste the JSON key contents into the sidebar on the left.
+
+**Then:**
+1. Paste your Google Drive folder link below.
+2. Click **Process All Documents**.
+3. Wait for processing to finish, then download the ZIP file.
+
+The ZIP will contain:
+- All updated `.docx` files (with graphs embedded)
+- All graphs as separate `.png` files
+        """)
+
+    st.markdown('---')
+    folder_url = st.text_input(
+        '🔗 Google Drive Folder Link',
+        placeholder='https://drive.google.com/drive/folders/XXXXXXXXXX'
+    )
 
     if st.button('🚀 Process All Documents', type='primary'):
         creds_str = creds_input.strip() if 'creds_input' in dir() else ''
         if not creds_str:
-            st.error('Paste your Service Account JSON in the sidebar first.')
+            st.error('Please paste your Service Account JSON in the sidebar on the left first.')
             st.stop()
         if not folder_url.strip():
-            st.error('Enter a Google Drive folder link.')
+            st.error('Please enter a Google Drive folder link.')
             st.stop()
 
         folder_id = extract_folder_id(folder_url.strip())
         if not folder_id:
-            st.error('Could not parse folder ID. URL should look like: '
-                     'https://drive.google.com/drive/folders/XXXXX')
+            st.error(
+                'Could not read the folder ID from that link.\n\n'
+                'The link should look like: `https://drive.google.com/drive/folders/XXXXX`'
+            )
             st.stop()
 
         with st.spinner('Connecting to Google Drive…'):
@@ -644,7 +809,7 @@ else:
                 service = get_drive_service(creds_str)
                 files   = list_docx_in_folder(service, folder_id)
             except Exception as e:
-                st.error(f'Drive connection failed: {e}')
+                st.error(f'Could not connect to Google Drive: {e}')
                 st.stop()
 
         if not files:
@@ -662,7 +827,7 @@ else:
             for idx, f in enumerate(files):
                 fname = f['name']
                 stem  = Path(fname).stem
-                status.markdown(f'⏳ **{fname}** ({idx+1}/{len(files)})…')
+                status.markdown(f'⏳ Working on **{fname}** ({idx+1} of {len(files)})…')
                 try:
                     doc_bytes = download_drive_file(service, f['id'])
                     updated_bytes, results = process_doc_bytes(doc_bytes)
@@ -672,10 +837,8 @@ else:
                         progress.progress((idx+1)/len(files))
                         continue
 
-                    # Add updated doc to ZIP
                     zf.writestr(f'Generated_Images/{stem}_with_images.docx', updated_bytes)
 
-                    # Add standalone PNGs to ZIP
                     for r_idx, r in enumerate(results):
                         if r['img_buf'] and not r['error']:
                             r['img_buf'].seek(0)
@@ -685,23 +848,23 @@ else:
                     ok  = sum(1 for r in results if r['img_buf'] and not r['error'])
                     err = sum(1 for r in results if r['error'])
                     summary.append(
-                        f'✅ **{fname}** — {ok} image(s) embedded'
-                        + (f', {err} skipped' if err else '')
+                        f'✅ **{fname}** — {ok} graph(s) embedded'
+                        + (f', {err} skipped (prompt not recognised)' if err else '')
                     )
                 except Exception as e:
-                    summary.append(f'❌ **{fname}** — {e}')
+                    summary.append(f'❌ **{fname}** — error: {e}')
                 progress.progress((idx+1)/len(files))
 
         status.empty()
         zip_buf.seek(0)
 
         st.markdown('---')
-        st.subheader('✅ Batch Complete')
+        st.subheader('✅ All done!')
         for line in summary:
             st.markdown(line)
 
         st.download_button(
-            '⬇️ Download All Files (ZIP)',
+            '⬇️ Download All Updated Files (ZIP)',
             data=zip_buf,
             file_name='Generated_Images.zip',
             mime='application/zip',
