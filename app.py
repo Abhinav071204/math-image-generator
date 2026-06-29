@@ -617,7 +617,7 @@ else:
     st.title('📁 Batch Mode — Google Drive')
     st.markdown(
         'Point the app at a Drive folder → processes every `.docx`, '
-        'embeds graphs, saves everything to a **`Generated_Images`** subfolder in your Drive.'
+        'embeds graphs, and gives you a **ZIP file to download** with all updated documents + images.'
     )
     st.markdown('---')
 
@@ -653,57 +653,57 @@ else:
 
         st.success(f'Found **{len(files)}** document(s). Processing…')
 
-        try:
-            out_folder_id = get_or_create_subfolder(service, folder_id, 'Generated_Images')
-        except Exception as e:
-            st.error(f'Could not create output subfolder: {e}')
-            st.stop()
+        progress  = st.progress(0)
+        status    = st.empty()
+        summary   = []
+        zip_buf   = io.BytesIO()
 
-        progress = st.progress(0)
-        status   = st.empty()
-        summary  = []
+        with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for idx, f in enumerate(files):
+                fname = f['name']
+                stem  = Path(fname).stem
+                status.markdown(f'⏳ **{fname}** ({idx+1}/{len(files)})…')
+                try:
+                    doc_bytes = download_drive_file(service, f['id'])
+                    updated_bytes, results = process_doc_bytes(doc_bytes)
 
-        for idx, f in enumerate(files):
-            fname = f['name']
-            status.markdown(f'⏳ **{fname}** ({idx+1}/{len(files)})…')
-            try:
-                doc_bytes        = download_drive_file(service, f['id'])
-                updated_bytes, results = process_doc_bytes(doc_bytes)
+                    if not results:
+                        summary.append(f'⚠️ **{fname}** — no placeholders found, skipped')
+                        progress.progress((idx+1)/len(files))
+                        continue
 
-                if not results:
-                    summary.append(f'⚠️ **{fname}** — no placeholders found')
-                    progress.progress((idx+1)/len(files))
-                    continue
+                    # Add updated doc to ZIP
+                    zf.writestr(f'Generated_Images/{stem}_with_images.docx', updated_bytes)
 
-                stem = Path(fname).stem
+                    # Add standalone PNGs to ZIP
+                    for r_idx, r in enumerate(results):
+                        if r['img_buf'] and not r['error']:
+                            r['img_buf'].seek(0)
+                            zf.writestr(f'Generated_Images/{stem}_image_{r_idx+1}.png',
+                                        r['img_buf'].read())
 
-                # Upload standalone PNGs
-                for r_idx, r in enumerate(results):
-                    if r['img_buf'] and not r['error']:
-                        r['img_buf'].seek(0)
-                        upload_to_drive(service, out_folder_id,
-                                        f'{stem}_image_{r_idx+1}.png',
-                                        r['img_buf'].read(), 'image/png')
-
-                # Upload updated doc
-                link = upload_to_drive(service, out_folder_id,
-                                       f'{stem}_with_images.docx', updated_bytes,
-                                       'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
-
-                ok  = sum(1 for r in results if r['img_buf'] and not r['error'])
-                err = sum(1 for r in results if r['error'])
-                summary.append(
-                    f'✅ **{fname}** — {ok} image(s) embedded'
-                    + (f', {err} skipped' if err else '')
-                    + (f' → [view doc]({link})' if link else '')
-                )
-            except Exception as e:
-                summary.append(f'❌ **{fname}** — {e}')
-            progress.progress((idx+1)/len(files))
+                    ok  = sum(1 for r in results if r['img_buf'] and not r['error'])
+                    err = sum(1 for r in results if r['error'])
+                    summary.append(
+                        f'✅ **{fname}** — {ok} image(s) embedded'
+                        + (f', {err} skipped' if err else '')
+                    )
+                except Exception as e:
+                    summary.append(f'❌ **{fname}** — {e}')
+                progress.progress((idx+1)/len(files))
 
         status.empty()
+        zip_buf.seek(0)
+
         st.markdown('---')
         st.subheader('✅ Batch Complete')
-        st.markdown('Files saved to the **Generated_Images** subfolder in your Drive.')
         for line in summary:
             st.markdown(line)
+
+        st.download_button(
+            '⬇️ Download All Files (ZIP)',
+            data=zip_buf,
+            file_name='Generated_Images.zip',
+            mime='application/zip',
+            use_container_width=True
+        )
