@@ -1,0 +1,18 @@
+# Never commit real secrets
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+venv/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp output
+*.png
+output_*.docx
