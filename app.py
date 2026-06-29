@@ -182,8 +182,17 @@ def parse_line_prompt(prompt):
         return m.group(1).lower() if m else None
 
     def extract_coord_pairs(block):
+        """Extract (x,y) pairs from both '(0,10)' and 'x=0, y=10' formats."""
         pairs = []
+        # Format 1: (x, y)
         for x, y in re.findall(r'\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)', block):
+            pt = (float(x), float(y))
+            if not pairs or pairs[-1] != pt:
+                pairs.append(pt)
+        if pairs:
+            return pairs
+        # Format 2: x=0, y=10 (one pair per "Point N:" line)
+        for x, y in re.findall(r'x\s*=\s*(-?\d+(?:\.\d+)?)\D+?y\s*=\s*(-?\d+(?:\.\d+)?)', block, re.I):
             pt = (float(x), float(y))
             if not pairs or pairs[-1] != pt:
                 pairs.append(pt)
@@ -245,6 +254,43 @@ def parse_line_prompt(prompt):
     return params
 
 
+def _synthesise_scatter_points(description, x_min, x_max, y_min, y_max, seed=42):
+    """Generate plausible scatter points from a text description."""
+    import random
+    rng = random.Random(seed)
+    n   = 10
+    xs  = [x_min + (x_max - x_min) * i / (n - 1) for i in range(n)]
+    d   = description.lower()
+
+    def jitter(v, lo, hi, amount=0.7):
+        return max(lo, min(hi, v + rng.uniform(-amount, amount) * (hi - lo) / n))
+
+    if re.search(r'no\s+clear\s+pattern|random|no\s+association|scattered\s+with\s+no', d):
+        pts = [(xs[i], y_min + rng.random() * (y_max - y_min)) for i in range(n)]
+    elif re.search(r'downward|negative|upper\s+left\s+to\s+lower\s+right|falls?|decreas', d):
+        pts = [(xs[i], jitter(y_max - (y_max - y_min) * i / (n - 1), y_min, y_max)) for i in range(n)]
+    elif re.search(r'upward|positive|lower\s+left\s+to\s+upper\s+right|ris(es?|ing)|increas|nearly\s+straight', d):
+        pts = [(xs[i], jitter(y_min + (y_max - y_min) * i / (n - 1), y_min, y_max, 0.3)) for i in range(n)]
+    elif re.search(r'revers', d):
+        pts = [(jitter(y_min + (y_max - y_min) * i / (n - 1), x_min, x_max, 0.3), xs[i]) for i in range(n)]
+    else:
+        pts = [(xs[i], jitter(y_min + (y_max - y_min) * i / (n - 1), y_min, y_max)) for i in range(n)]
+
+    return [(round(x, 1), round(y, 1)) for x, y in pts]
+
+
+def _extract_axis_labels_from_intro(text):
+    """Pull axis labels from intro sentence like 'plots showing seashell length and mass'."""
+    m = re.search(
+        r'scatter\s+plots?\s+(?:showing|of|for|comparing)\s+'
+        r'([a-z][a-z\s]+?)\s+and\s+([a-z][a-z\s]+?)[\.,]',
+        text, re.I
+    )
+    if m:
+        return to_sentence_case(m.group(1).strip()), to_sentence_case(m.group(2).strip())
+    return None, None
+
+
 def parse_scatter_prompt(prompt):
     p = prompt.replace('\n', ' ').strip()
     grade_band = extract_grade_band(p)
@@ -253,44 +299,63 @@ def parse_scatter_prompt(prompt):
         'y_label': 'y', 'y_min': 0, 'y_max': 10,
         'plots': {}, 'grade_band': grade_band,
         'color_mode': resolve_color_mode(grade_band),
+        'plot_descriptions': {},
     }
-    xl = re.search(r'(?:x-axis|horizontal\s+axis)\s*(?:labeled|as)?\s*"([^"]+)"', p, re.I)
-    yl = re.search(r'(?:y-axis|vertical\s+axis)\s*(?:labeled|as)?\s*"([^"]+)"', p, re.I)
+    xl = re.search(r'(?:x-axis|horizontal\s+axis)\s*(?:labeled?|as)?\s*"([^"]+)"', p, re.I)
+    yl = re.search(r'(?:y-axis|vertical\s+axis)\s*(?:labeled?|as)?\s*"([^"]+)"', p, re.I)
     if xl: params['x_label'] = to_sentence_case(xl.group(1))
     if yl: params['y_label'] = to_sentence_case(yl.group(1))
+
+    if not xl or not yl:
+        ix, iy = _extract_axis_labels_from_intro(p)
+        if ix and not xl: params['x_label'] = ix
+        if iy and not yl: params['y_label'] = iy
+
     xr = re.search(r'(?:x-axis|horizontal\s+axis)[^.]*?from\s+(-?\d+(?:\.\d+)?)\s+to\s+(-?\d+(?:\.\d+)?)', p, re.I)
     yr = re.search(r'(?:y-axis|vertical\s+axis)[^.]*?from\s+(-?\d+(?:\.\d+)?)\s+to\s+(-?\d+(?:\.\d+)?)', p, re.I)
-    if xr:
-        params['x_min'], params['x_max'] = float(xr.group(1)), float(xr.group(2))
-    if yr:
-        params['y_min'], params['y_max'] = float(yr.group(1)), float(yr.group(2))
+    if xr: params['x_min'], params['x_max'] = float(xr.group(1)), float(xr.group(2))
+    if yr: params['y_min'], params['y_max'] = float(yr.group(1)), float(yr.group(2))
 
-    # ----------------------------------------------------------------
-    # FIX 2: more robust scatter parser — handles both
-    #   "Plot A: (1,2), (3,4)" and "Plot A points 1,2,3,4"
-    # ----------------------------------------------------------------
-    plot_starts = [(m.group(1).upper(), m.start()) for m in re.finditer(r'\bPlot\s+([A-Za-z0-9])\b', p, re.I)]
+    plot_starts = [
+        (m.group(1).upper(), m.start())
+        for m in re.finditer(r'\bPlot\s+([A-Za-z0-9])\b', p, re.I)
+    ]
     plots = {}
+    descriptions = {}
+
     for i, (label, start) in enumerate(plot_starts):
         end   = plot_starts[i + 1][1] if i + 1 < len(plot_starts) else len(p)
         block = p[start:end]
 
-        # First preference: explicit (x,y) pairs
+        # 1st: explicit (x,y) pairs
         paren_pts = re.findall(r'\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)', block)
         if paren_pts:
             pts = [(float(x), float(y)) for x, y in paren_pts]
-        else:
-            # Second preference: flat number list "points 1,2,3,4 …"
-            m = re.search(r'points?\s*([\d.,\s\-]+)', block, re.I)
-            pts = []
-            if m:
-                nums = [float(n) for n in re.findall(r'-?\d+(?:\.\d+)?', m.group(1))]
-                pts  = list(zip(nums[0::2], nums[1::2]))
+            plots[label] = [(int(x) if x == int(x) else x, int(y) if y == int(y) else y) for x, y in pts]
+            continue
 
-        if pts:
-            plots[label] = [(int(x) if x == int(x) else x,
-                             int(y) if y == int(y) else y) for x, y in pts]
-    params['plots'] = plots
+        # 2nd: flat number list
+        m_pts = re.search(r'points?\s+([\d.,\s\-]+)', block, re.I)
+        if m_pts:
+            nums = [float(n) for n in re.findall(r'-?\d+(?:\.\d+)?', m_pts.group(1))]
+            pts  = list(zip(nums[0::2], nums[1::2]))
+            if pts:
+                plots[label] = [(int(x) if x == int(x) else x, int(y) if y == int(y) else y) for x, y in pts]
+                continue
+
+        # 3rd: synthesise from description text
+        desc = re.sub(r'^Plot\s+[A-Za-z0-9]\s+shows?\s+points?\s*[—\-]*\s*', '', block, flags=re.I).strip()
+        descriptions[label] = desc
+        pts = _synthesise_scatter_points(
+            desc,
+            params['x_min'], params['x_max'],
+            params['y_min'], params['y_max'],
+            seed=ord(label)
+        )
+        plots[label] = pts
+
+    params['plots']             = plots
+    params['plot_descriptions'] = descriptions
     return params
 
 
@@ -818,10 +883,29 @@ The ZIP will contain:
 
         st.success(f'Found **{len(files)}** document(s). Processing…')
 
+        # Option: also upload back to Drive
+        upload_back = st.checkbox(
+            '☁️ Also save updated files back to Google Drive '
+            '(into a "Generated_Images" sub-folder in the same folder)',
+            value=True
+        )
+
         progress  = st.progress(0)
         status    = st.empty()
         summary   = []
         zip_buf   = io.BytesIO()
+
+        # Create Drive sub-folder once (if needed)
+        drive_subfolder_id = None
+        if upload_back:
+            try:
+                drive_subfolder_id = get_or_create_subfolder(service, folder_id, 'Generated_Images')
+            except Exception as e:
+                st.warning(f'Could not create Drive sub-folder: {e}. Files will still be in the ZIP.')
+                drive_subfolder_id = None
+
+        DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        PNG_MIME  = 'image/png'
 
         with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
             for idx, f in enumerate(files):
@@ -837,18 +921,36 @@ The ZIP will contain:
                         progress.progress((idx+1)/len(files))
                         continue
 
-                    zf.writestr(f'Generated_Images/{stem}_with_images.docx', updated_bytes)
+                    out_docx_name = f'{stem}_with_images.docx'
+                    zf.writestr(f'Generated_Images/{out_docx_name}', updated_bytes)
+
+                    # Upload updated docx to Drive
+                    if drive_subfolder_id:
+                        try:
+                            link = upload_to_drive(service, drive_subfolder_id,
+                                                   out_docx_name, updated_bytes, DOCX_MIME)
+                        except Exception as ue:
+                            link = None
+                            st.warning(f'Drive upload failed for {fname}: {ue}')
 
                     for r_idx, r in enumerate(results):
                         if r['img_buf'] and not r['error']:
                             r['img_buf'].seek(0)
-                            zf.writestr(f'Generated_Images/{stem}_image_{r_idx+1}.png',
-                                        r['img_buf'].read())
+                            png_data = r['img_buf'].read()
+                            png_name = f'{stem}_image_{r_idx+1}.png'
+                            zf.writestr(f'Generated_Images/{png_name}', png_data)
+                            if drive_subfolder_id:
+                                try:
+                                    upload_to_drive(service, drive_subfolder_id,
+                                                    png_name, png_data, PNG_MIME)
+                                except Exception:
+                                    pass
 
                     ok  = sum(1 for r in results if r['img_buf'] and not r['error'])
                     err = sum(1 for r in results if r['error'])
+                    drive_note = ' + saved to Drive' if drive_subfolder_id else ''
                     summary.append(
-                        f'✅ **{fname}** — {ok} graph(s) embedded'
+                        f'✅ **{fname}** — {ok} graph(s) embedded{drive_note}'
                         + (f', {err} skipped (prompt not recognised)' if err else '')
                     )
                 except Exception as e:
@@ -862,6 +964,9 @@ The ZIP will contain:
         st.subheader('✅ All done!')
         for line in summary:
             st.markdown(line)
+
+        if drive_subfolder_id:
+            st.info('📁 Updated files have been saved to the **Generated_Images** folder inside your Google Drive folder.')
 
         st.download_button(
             '⬇️ Download All Updated Files (ZIP)',
