@@ -640,19 +640,20 @@ def download_drive_file(service, file_id):
     buf.seek(0)
     return buf.read()
 
-def get_or_create_subfolder(service, parent_id, name='Generated_Images'):
-    q = (f"'{parent_id}' in parents and mimeType='application/vnd.google-apps.folder' "
-         f"and name='{name}' and trashed=false")
-    res = service.files().list(q=q, fields='files(id)').execute()
-    if res['files']: return res['files'][0]['id']
-    meta = {'name': name, 'mimeType': 'application/vnd.google-apps.folder', 'parents': [parent_id]}
-    return service.files().create(body=meta, fields='id').execute()['id']
-
-def upload_to_drive(service, folder_id, name, data, mime):
+def update_drive_file(service, file_id, data, mime):
+    """
+    Update an EXISTING Drive file in-place.
+    Service accounts have no storage quota for CREATE, but can UPDATE
+    files they already have Editor access to (the quota belongs to the
+    file owner, not the service account).
+    """
     from googleapiclient.http import MediaIoBaseUpload
-    meta  = {'name': name, 'parents': [folder_id]}
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime)
-    f = service.files().create(body=meta, media_body=media, fields='id,webViewLink').execute()
+    f = service.files().update(
+        fileId=file_id,
+        media_body=media,
+        fields='id,webViewLink'
+    ).execute()
     return f.get('webViewLink', '')
 
 
@@ -883,37 +884,28 @@ The ZIP will contain:
 
         st.success(f'Found **{len(files)}** document(s). Processing…')
 
-        # Option: also upload back to Drive
+        # Option: save back to Drive by updating the original file in-place
         upload_back = st.checkbox(
             '☁️ Also save updated files back to Google Drive '
-            '(into a "Generated_Images" sub-folder in the same folder)',
+            '(replaces the original .docx in-place — no storage quota needed)',
             value=True
         )
 
-        progress  = st.progress(0)
-        status    = st.empty()
-        summary   = []
-        zip_buf   = io.BytesIO()
-
-        # Create Drive sub-folder once (if needed)
-        drive_subfolder_id = None
-        if upload_back:
-            try:
-                drive_subfolder_id = get_or_create_subfolder(service, folder_id, 'Generated_Images')
-            except Exception as e:
-                st.warning(f'Could not create Drive sub-folder: {e}. Files will still be in the ZIP.')
-                drive_subfolder_id = None
+        progress = st.progress(0)
+        status   = st.empty()
+        summary  = []
+        zip_buf  = io.BytesIO()
 
         DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-        PNG_MIME  = 'image/png'
 
         with zipfile.ZipFile(zip_buf, 'w', zipfile.ZIP_DEFLATED) as zf:
             for idx, f in enumerate(files):
-                fname = f['name']
-                stem  = Path(fname).stem
+                fname   = f['name']
+                file_id = f['id']
+                stem    = Path(fname).stem
                 status.markdown(f'⏳ Working on **{fname}** ({idx+1} of {len(files)})…')
                 try:
-                    doc_bytes = download_drive_file(service, f['id'])
+                    doc_bytes = download_drive_file(service, file_id)
                     updated_bytes, results = process_doc_bytes(doc_bytes)
 
                     if not results:
@@ -921,34 +913,25 @@ The ZIP will contain:
                         progress.progress((idx+1)/len(files))
                         continue
 
-                    out_docx_name = f'{stem}_with_images.docx'
-                    zf.writestr(f'Generated_Images/{out_docx_name}', updated_bytes)
-
-                    # Upload updated docx to Drive
-                    if drive_subfolder_id:
-                        try:
-                            link = upload_to_drive(service, drive_subfolder_id,
-                                                   out_docx_name, updated_bytes, DOCX_MIME)
-                        except Exception as ue:
-                            link = None
-                            st.warning(f'Drive upload failed for {fname}: {ue}')
-
+                    # Always add to ZIP
+                    zf.writestr(f'Updated_Docs/{fname}', updated_bytes)
                     for r_idx, r in enumerate(results):
                         if r['img_buf'] and not r['error']:
                             r['img_buf'].seek(0)
-                            png_data = r['img_buf'].read()
-                            png_name = f'{stem}_image_{r_idx+1}.png'
-                            zf.writestr(f'Generated_Images/{png_name}', png_data)
-                            if drive_subfolder_id:
-                                try:
-                                    upload_to_drive(service, drive_subfolder_id,
-                                                    png_name, png_data, PNG_MIME)
-                                except Exception:
-                                    pass
+                            zf.writestr(f'Images/{stem}_image_{r_idx+1}.png', r['img_buf'].read())
+
+                    # Update the ORIGINAL file in Drive in-place (uses owner quota, not SA quota)
+                    drive_saved = False
+                    if upload_back:
+                        try:
+                            update_drive_file(service, file_id, updated_bytes, DOCX_MIME)
+                            drive_saved = True
+                        except Exception as ue:
+                            summary.append(f'  ⚠️ Drive update failed for **{fname}**: `{ue}`')
 
                     ok  = sum(1 for r in results if r['img_buf'] and not r['error'])
                     err = sum(1 for r in results if r['error'])
-                    drive_note = ' + saved to Drive' if drive_subfolder_id else ''
+                    drive_note = ' · ☁️ updated in Drive' if drive_saved else ''
                     summary.append(
                         f'✅ **{fname}** — {ok} graph(s) embedded{drive_note}'
                         + (f', {err} skipped (prompt not recognised)' if err else '')
@@ -965,13 +948,16 @@ The ZIP will contain:
         for line in summary:
             st.markdown(line)
 
-        if drive_subfolder_id:
-            st.info('📁 Updated files have been saved to the **Generated_Images** folder inside your Google Drive folder.')
+        if upload_back:
+            st.info(
+                '☁️ **Drive update:** The original `.docx` files in your folder have been updated '
+                'in-place with graphs embedded. Open them directly in Google Drive to check.'
+            )
 
         st.download_button(
             '⬇️ Download All Updated Files (ZIP)',
             data=zip_buf,
-            file_name='Generated_Images.zip',
+            file_name='Updated_Docs_with_Graphs.zip',
             mime='application/zip',
             use_container_width=True
         )
