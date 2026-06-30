@@ -460,18 +460,41 @@ def parse_scatter_prompt(prompt):
     return params
 
 
-MIN_PROMPT_WORDS = 6  # prompts with 5 words or fewer are treated as "no real image requested"
+MIN_PROMPT_WORDS = 6  # prompts with 5 words or fewer AND no graph signal are treated as "no real image requested"
+
+def _has_graph_signal(prompt):
+    """
+    True if the prompt contains anything that looks like real graph data —
+    a coordinate pair, an equation, a digit, or a 'Plot X' marker — even if
+    the prompt is short. Short, content-bearing prompts like
+    'Plot A: (1,2), (3,4)' should NOT be filtered out, only truly empty
+    filler like 'n/a' or 'none' should be.
+    """
+    if re.search(r'\(\s*-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?\s*\)', prompt):  # (x,y) pair
+        return True
+    if re.search(r'\by\s*=', prompt, re.I):                                    # y = ...
+        return True
+    if re.search(r'\bplot\s+[a-z0-9]\b', prompt, re.I):                       # Plot A / Plot 1
+        return True
+    if re.search(r'\d', prompt):                                              # any digit at all
+        return True
+    return False
+
 
 def is_too_short_to_be_a_graph_prompt(prompt):
     """
-    Returns True if the prompt has 5 or fewer words — too short to plausibly
-    describe a graph (e.g. 'n/a', 'none', 'no image needed', 'TBD').
-    Prevents the AI/regex parsers from hallucinating a graph out of filler text.
+    Returns True only when the prompt is BOTH 5 words or fewer AND contains
+    no graph-like signal (no numbers, coordinates, equations, or "Plot X"
+    markers). This filters out genuine filler — 'n/a', 'none', 'TBD',
+    'no image needed' — without rejecting legitimate terse prompts like
+    'Plot A: (1,2), (3,4)' that happen to be short but DO carry real data.
     """
     if not prompt or not prompt.strip():
         return True
     words = re.findall(r'\S+', prompt.strip())
-    return len(words) <= 5
+    if len(words) > 5:
+        return False
+    return not _has_graph_signal(prompt)
 
 
 def parse_prompt(prompt, use_ai=False, ai_api_key=None):
@@ -638,6 +661,34 @@ def render_image(params, img_type):
 # ============================================================
 # DOCX HELPERS
 # ============================================================
+def iter_all_paragraphs(doc):
+    """
+    Yield every paragraph in the document, including paragraphs nested inside
+    tables (and tables nested inside table cells, to any depth).
+
+    python-docx's doc.paragraphs only returns top-level body paragraphs and
+    silently skips anything inside a table — which is where exit-ticket /
+    worksheet templates very often put their 'Image (if any):' placeholder
+    (e.g. inside a Question / Answer / Image grid).
+    """
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+    from docx.oxml.ns import qn
+
+    def _iter_block_items(parent_element):
+        for child in parent_element:
+            tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+            if tag == 'p':
+                yield Paragraph(child, doc)
+            elif tag == 'tbl':
+                table = Table(child, doc)
+                for row in table.rows:
+                    for cell in row.cells:
+                        yield from _iter_block_items(cell._element)
+
+    yield from _iter_block_items(doc.element.body)
+
+
 def extract_full_text(para):
     parts = []
     for elem in para._element.iter():
@@ -650,22 +701,51 @@ def extract_full_text(para):
     return ''.join(parts)
 
 def find_image_placeholders(doc):
+    """
+    Find every paragraph (anywhere in the document — body, tables, nested
+    tables) that contains an 'Image (if any):' style marker.
+
+    The match is intentionally permissive about punctuation/spacing variants
+    Word commonly introduces (smart quotes, non-breaking spaces, missing
+    colon, parentheses style) so genuine placeholders aren't silently missed.
+    """
     found = []
-    for i, para in enumerate(doc.paragraphs):
-        text = extract_full_text(para)
-        if re.search(r'image\s*\(if any\)\s*:', text, re.IGNORECASE):
+    # Matches: "Image (if any):", "Image(If Any) :", "Image - if any:",
+    # "Image if any:", with normal or non-breaking spaces, optional colon.
+    pattern = re.compile(
+        r'image\s*[\(\-]?\s*if\s+any\s*\)?\s*:?',
+        re.IGNORECASE
+    )
+    for i, para in enumerate(iter_all_paragraphs(doc)):
+        raw_text = extract_full_text(para)
+        # Normalise non-breaking spaces so the regex above matches reliably
+        text = raw_text.replace('\xa0', ' ')
+        if pattern.search(text):
             has_content = len(text.strip()) > len('Image (if any):') + 2
-            found.append({'para_index': i, 'text': text.strip(), 'has_content': has_content})
+            found.append({
+                'para_index': i,
+                'text': text.strip(),
+                'has_content': has_content,
+                'paragraph': para,   # keep a direct reference — used for table-safe replacement
+            })
     return found
 
-def replace_placeholder(doc, para_index, img_bytes):
-    """Replace the target paragraph's XML with a fresh <w:p> containing only
-    the image run — avoids leftover runs / broken element trees."""
+def replace_placeholder(doc, para, img_bytes):
+    """
+    Replace the target paragraph's XML with a fresh <w:p> containing only
+    the image run — avoids leftover runs / broken element trees.
+
+    `para` must be the actual python-docx Paragraph object to replace (NOT
+    an index into doc.paragraphs — that list excludes paragraphs inside
+    tables, where placeholders are often found in worksheet/exit-ticket
+    templates). Since we work directly off the paragraph's own XML element
+    and its real parent, this works identically whether the paragraph lives
+    in the document body or inside a table cell at any nesting depth.
+    """
     from docx.oxml.ns import qn
     from docx.oxml   import OxmlElement
     from copy        import deepcopy
 
-    para   = doc.paragraphs[para_index]
     p_elem = para._element
 
     pPr = p_elem.find(qn('w:pPr'))
@@ -691,6 +771,11 @@ def replace_placeholder(doc, para_index, img_bytes):
     p_elem.getparent().replace(p_elem, new_p)
 
 
+PLACEHOLDER_PREFIX_RE = re.compile(
+    r'^image\s*[\(\-]?\s*if\s+any\s*\)?\s*:?\s*', re.IGNORECASE
+)
+
+
 def process_doc_bytes(doc_bytes, use_ai=False, ai_api_key=None):
     """Process a .docx bytes blob. Returns (updated_doc_bytes, results_list)."""
     doc          = Document(io.BytesIO(doc_bytes))
@@ -698,9 +783,9 @@ def process_doc_bytes(doc_bytes, use_ai=False, ai_api_key=None):
     results      = []
     for ph in placeholders:
         raw    = ph['text']
-        prompt = re.sub(r'^image\s*\(if any\)\s*:\s*', '', raw, flags=re.I).strip()
-        entry  = {'placeholder': raw, 'para_index': ph['para_index'], 'prompt': prompt,
-                  'img_type': None, 'parse_method': None, 'img_buf': None, 'error': None}
+        prompt = PLACEHOLDER_PREFIX_RE.sub('', raw).strip()
+        entry  = {'placeholder': raw, 'para_index': ph['para_index'], 'paragraph': ph['paragraph'],
+                  'prompt': prompt, 'img_type': None, 'parse_method': None, 'img_buf': None, 'error': None}
         if not prompt:
             entry['error'] = 'Empty prompt'
             results.append(entry)
@@ -724,11 +809,14 @@ def process_doc_bytes(doc_bytes, use_ai=False, ai_api_key=None):
             entry['error'] = str(e)
         results.append(entry)
 
-    # Embed in reverse paragraph order so earlier replacements don't shift later indices
-    for r in sorted(results, key=lambda x: x['para_index'], reverse=True):
+    # Embed each successfully-generated image directly into its source paragraph.
+    # We operate on the stored Paragraph object (not a flat index), so this is
+    # correct regardless of whether the placeholder was in the document body
+    # or nested inside a table cell.
+    for r in results:
         if r['img_buf'] and not r['error']:
             r['img_buf'].seek(0)
-            replace_placeholder(doc, r['para_index'], r['img_buf'])
+            replace_placeholder(doc, r['paragraph'], r['img_buf'])
 
     out = io.BytesIO()
     doc.save(out)
@@ -892,7 +980,7 @@ if '📄 Single' in mode:
 
         if placeholders and selected_idx is not None:
             debug_raw    = placeholders[selected_idx]['text']
-            debug_prompt = re.sub(r'^image\s*\(if any\)\s*:\s*', '', debug_raw, flags=re.I).strip()
+            debug_prompt = PLACEHOLDER_PREFIX_RE.sub('', debug_raw).strip()
             with st.expander('🔍 Debug: prompt extracted from document', expanded=True):
                 st.code(debug_prompt or '(empty — nothing found after "Image (if any):")')
 
@@ -953,7 +1041,13 @@ if '📄 Single' in mode:
                             uploaded.seek(0)
                             doc2 = Document(uploaded)
                             img_buf.seek(0)
-                            replace_placeholder(doc2, placeholders[selected_idx]['para_index'], img_buf)
+                            # doc2 is a fresh Document instance, so we must re-locate the
+                            # target paragraph inside it by index — the Paragraph object
+                            # stored against the original `doc_obj` belongs to a different
+                            # Document and can't be reused here.
+                            doc2_placeholders = find_image_placeholders(doc2)
+                            target_para = doc2_placeholders[selected_idx]['paragraph']
+                            replace_placeholder(doc2, target_para, img_buf)
                             doc_out = io.BytesIO()
                             doc2.save(doc_out)
                             doc_out.seek(0)
