@@ -1,4 +1,5 @@
 import streamlit as st
+import anthropic, json
 import os, re, io, zipfile
 from pathlib import Path
 import numpy as np
@@ -9,7 +10,7 @@ import matplotlib.font_manager as fm
 from docx import Document
 from docx.shared import Inches
 from lxml import etree
-import anthropic, json
+
 
 # ============================================================
 # PAGE CONFIG
