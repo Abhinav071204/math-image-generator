@@ -677,7 +677,7 @@ def process_doc_bytes(doc_bytes, use_ai=False, ai_api_key=None):
     for ph in placeholders:
         raw    = ph['text']
         prompt = re.sub(r'^image\s*\(if any\)\s*:\s*', '', raw, flags=re.I).strip()
-        entry  = {'placeholder': raw, 'para_index': ph['para_index'],
+        entry  = {'placeholder': raw, 'para_index': ph['para_index'], 'prompt': prompt,
                   'img_type': None, 'parse_method': None, 'img_buf': None, 'error': None}
         if not prompt:
             entry['error'] = 'Empty prompt'
@@ -859,13 +859,14 @@ if '📄 Single' in mode:
                 options=range(len(placeholders)),
                 format_func=lambda i: f"[Para {placeholders[i]['para_index']}] {placeholders[i]['text'][:70]}..."
             )
-            # DEBUG: show exactly what text was extracted from the document
+        else:
+            st.info('Upload a document to see placeholders.')
+
+        if placeholders and selected_idx is not None:
             debug_raw    = placeholders[selected_idx]['text']
             debug_prompt = re.sub(r'^image\s*\(if any\)\s*:\s*', '', debug_raw, flags=re.I).strip()
             with st.expander('🔍 Debug: prompt extracted from document', expanded=True):
                 st.code(debug_prompt or '(empty — nothing found after "Image (if any):")')
-        else:
-            st.info('Upload a document to see placeholders.')
 
         st.subheader('3 — Paste Prompt')
         prompt = st.text_area(
@@ -968,6 +969,14 @@ The ZIP will contain:
         placeholder='https://drive.google.com/drive/folders/XXXXXXXXXX'
     )
 
+    show_batch_debug = st.checkbox(
+        '🔍 Show debug info (extracted prompts per document)',
+        value=False,
+        help='When checked, after processing you can expand each document to see exactly '
+             'what prompt text was extracted from every placeholder, what type was detected, '
+             'and how it was parsed.'
+    )
+
     if st.button('🚀 Process All Documents', type='primary'):
         creds_str = creds_input.strip() if 'creds_input' in dir() else ''
         if not creds_str:
@@ -1005,10 +1014,11 @@ The ZIP will contain:
             value=True
         )
 
-        progress = st.progress(0)
-        status   = st.empty()
-        summary  = []
-        zip_buf  = io.BytesIO()
+        progress     = st.progress(0)
+        status       = st.empty()
+        summary      = []
+        debug_blocks = []   # (fname, list_of_result_dicts) — used if show_batch_debug
+        zip_buf      = io.BytesIO()
 
         DOCX_MIME = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 
@@ -1027,6 +1037,9 @@ The ZIP will contain:
                         summary.append(f'⚠️ **{fname}** — no placeholders found, skipped')
                         progress.progress((idx+1)/len(files))
                         continue
+
+                    if show_batch_debug:
+                        debug_blocks.append((fname, results))
 
                     zf.writestr(f'Updated_Docs/{fname}', updated_bytes)
                     for r_idx, r in enumerate(results):
@@ -1066,6 +1079,25 @@ The ZIP will contain:
                 '☁️ **Drive update:** The original `.docx` files in your folder have been updated '
                 'in-place with graphs embedded. Open them directly in Google Drive to check.'
             )
+
+        # ---- Batch debug view ----
+        if show_batch_debug and debug_blocks:
+            st.markdown('---')
+            st.subheader('🔍 Debug: prompts extracted per document')
+            for fname, results in debug_blocks:
+                with st.expander(f'📄 {fname}  —  {len(results)} placeholder(s)', expanded=False):
+                    for i, r in enumerate(results):
+                        st.markdown(f"**Placeholder {i+1}** (paragraph {r['para_index']})")
+                        st.code(r.get('prompt') or '(empty)')
+                        status_line = f"Type: `{r['img_type']}`"
+                        if r.get('parse_method'):
+                            status_line += f" · Parsed with: `{r['parse_method']}`"
+                        if r['error']:
+                            status_line += f" · ❌ Error: {r['error']}"
+                        else:
+                            status_line += " · ✅ Image generated"
+                        st.caption(status_line)
+                        st.markdown('---')
 
         st.download_button(
             '⬇️ Download All Updated Files (ZIP)',
