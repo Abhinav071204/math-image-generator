@@ -9,6 +9,7 @@ import matplotlib.font_manager as fm
 from docx import Document
 from docx.shared import Inches
 from lxml import etree
+import anthropic, json
 
 # ============================================================
 # PAGE CONFIG
@@ -301,6 +302,25 @@ def parse_scatter_prompt(prompt):
         'color_mode': resolve_color_mode(grade_band),
         'plot_descriptions': {},
     }
+    
+
+def parse_with_ai(prompt, img_type_hint=None):
+    client = anthropic.Anthropic()
+    resp = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1000,
+        messages=[{
+            "role": "user",
+            "content": f"""Extract graph data from this prompt as JSON only, no prose.
+Schema: {{"type":"line_graph"|"scatter_grid","title":str,"x_label":str,"y_label":str,
+"x_min":num,"x_max":num,"y_min":num,"y_max":num,
+"lines":[{{"name":str,"points":[[x,y],[x,y]],"style":"solid"|"dashed"|"dotted"}}],
+"intersection":[x,y]|null}}
+
+Prompt: {prompt}"""
+        }]
+    )
+    return json.loads(resp.content[0].text)
     xl = re.search(r'(?:x-axis|horizontal\s+axis)\s*(?:labeled?|as)?\s*"([^"]+)"', p, re.I)
     yl = re.search(r'(?:y-axis|vertical\s+axis)\s*(?:labeled?|as)?\s*"([^"]+)"', p, re.I)
     if xl: params['x_label'] = to_sentence_case(xl.group(1))
