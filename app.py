@@ -665,11 +665,6 @@ def iter_all_paragraphs(doc):
     """
     Yield every paragraph in the document, including paragraphs nested inside
     tables (and tables nested inside table cells, to any depth).
-
-    python-docx's doc.paragraphs only returns top-level body paragraphs and
-    silently skips anything inside a table — which is where exit-ticket /
-    worksheet templates very often put their 'Image (if any):' placeholder
-    (e.g. inside a Question / Answer / Image grid).
     """
     from docx.table import Table
     from docx.text.paragraph import Paragraph
@@ -704,21 +699,14 @@ def find_image_placeholders(doc):
     """
     Find every paragraph (anywhere in the document — body, tables, nested
     tables) that contains an 'Image (if any):' style marker.
-
-    The match is intentionally permissive about punctuation/spacing variants
-    Word commonly introduces (smart quotes, non-breaking spaces, missing
-    colon, parentheses style) so genuine placeholders aren't silently missed.
     """
     found = []
-    # Matches: "Image (if any):", "Image(If Any) :", "Image - if any:",
-    # "Image if any:", with normal or non-breaking spaces, optional colon.
     pattern = re.compile(
         r'image\s*[\(\-]?\s*if\s+any\s*\)?\s*:?',
         re.IGNORECASE
     )
     for i, para in enumerate(iter_all_paragraphs(doc)):
         raw_text = extract_full_text(para)
-        # Normalise non-breaking spaces so the regex above matches reliably
         text = raw_text.replace('\xa0', ' ')
         if pattern.search(text):
             has_content = len(text.strip()) > len('Image (if any):') + 2
@@ -726,7 +714,7 @@ def find_image_placeholders(doc):
                 'para_index': i,
                 'text': text.strip(),
                 'has_content': has_content,
-                'paragraph': para,   # keep a direct reference — used for table-safe replacement
+                'paragraph': para,
             })
     return found
 
@@ -734,13 +722,6 @@ def replace_placeholder(doc, para, img_bytes):
     """
     Replace the target paragraph's XML with a fresh <w:p> containing only
     the image run — avoids leftover runs / broken element trees.
-
-    `para` must be the actual python-docx Paragraph object to replace (NOT
-    an index into doc.paragraphs — that list excludes paragraphs inside
-    tables, where placeholders are often found in worksheet/exit-ticket
-    templates). Since we work directly off the paragraph's own XML element
-    and its real parent, this works identically whether the paragraph lives
-    in the document body or inside a table cell at any nesting depth.
     """
     from docx.oxml.ns import qn
     from docx.oxml   import OxmlElement
@@ -809,10 +790,6 @@ def process_doc_bytes(doc_bytes, use_ai=False, ai_api_key=None):
             entry['error'] = str(e)
         results.append(entry)
 
-    # Embed each successfully-generated image directly into its source paragraph.
-    # We operate on the stored Paragraph object (not a flat index), so this is
-    # correct regardless of whether the placeholder was in the document body
-    # or nested inside a table cell.
     for r in results:
         if r['img_buf'] and not r['error']:
             r['img_buf'].seek(0)
@@ -869,6 +846,30 @@ def update_drive_file(service, file_id, data, mime):
 
 
 # ============================================================
+# CREDENTIAL HELPERS — never display raw secrets in the UI
+# ============================================================
+def get_google_creds_str():
+    """
+    Returns the Google service-account JSON as a string, sourced ONLY from
+    Streamlit secrets — never shown or editable in the UI, so non-technical
+    users (and anyone who can see their screen) never see the raw key.
+    """
+    try:
+        val = st.secrets.get('GOOGLE_CREDS_JSON', '')
+    except Exception:
+        val = ''
+    if isinstance(val, dict):
+        return json.dumps(val)
+    return val or ''
+
+def get_anthropic_key():
+    try:
+        return st.secrets.get('ANTHROPIC_API_KEY', '') or ''
+    except Exception:
+        return ''
+
+
+# ============================================================
 # SIDEBAR
 # ============================================================
 with st.sidebar:
@@ -876,58 +877,36 @@ with st.sidebar:
     st.markdown('---')
     mode = st.radio('**Mode**', ['📄 Single Document', '📁 Batch (Google Drive)'])
 
-    st.markdown('---')
-    st.markdown('**Prompt Parsing**')
-    use_ai = st.checkbox(
-        '🤖 Use AI parsing (optional, costs money)',
-        value=False,
-        help='Off by default. The free rule-based parser handles most prompts. '
-             'Only enable this if you have your own Anthropic API key and want '
-             'extra-flexible prompt understanding.'
-    )
-    ai_api_key = None
-    if use_ai:
-        default_key = ''
-        try: default_key = st.secrets.get('ANTHROPIC_API_KEY', '')
-        except Exception: pass
-        ai_api_key = st.text_input(
-            'Anthropic API Key', value=default_key, type='password',
-            help='Your own key from console.anthropic.com — billed to you, pay-as-you-go.'
-        )
-        st.caption('⚠️ This uses your API credits. Falls back to the free parser automatically if it fails.')
+    # AI parsing is configured centrally via secrets — no key entry box,
+    # no checkbox exposed to end users. If a key is present in secrets,
+    # it's used silently as a fallback; otherwise the free parser is used.
+    ai_api_key = get_anthropic_key()
+    use_ai = bool(ai_api_key)
 
     if 'Batch' in mode:
         st.markdown('---')
-        st.markdown('**Google Drive — Service Account JSON**')
-        default_creds = ''
-        try: default_creds = st.secrets.get('GOOGLE_CREDS_JSON', '')
-        except Exception: pass
-        creds_input = st.text_area(
-            'Paste Service Account JSON',
-            value=default_creds, height=140,
-            placeholder='{"type": "service_account", ...}',
-            help='Share your Drive folder with the service account email (Editor access).'
-        )
-        st.caption('🔒 Never stored or logged.')
-
-        # Surface the service-account email so coworkers can copy/paste it
-        # straight into Google Drive's Share dialog without needing to open
-        # the JSON file themselves.
+        st.markdown('**Google Drive Connection**')
+        google_creds_str = get_google_creds_str()
         sa_email = None
-        if creds_input.strip():
+        if google_creds_str.strip():
             try:
-                sa_email = json.loads(creds_input).get('client_email')
+                sa_email = json.loads(google_creds_str).get('client_email')
             except Exception:
                 sa_email = None
         if sa_email:
-            st.success(f'📧 Service account: `{sa_email}`')
+            st.success('✅ Connected to Google Drive')
             st.caption(
-                'Share your Google Drive folder with this email (Editor access) '
+                f'Share your Drive folder with **{sa_email}** (Editor access) '
                 'before running Batch mode — see the "How to use Batch Mode" guide above.'
+            )
+        else:
+            st.error(
+                '⚠️ Google Drive isn\'t connected yet. Ask your admin to add the '
+                'service account credentials in the app settings.'
             )
 
     st.markdown('---')
-    st.caption('Graph generation always runs free on the server. AI parsing is optional and off by default.')
+    st.caption('Graph generation always runs free on the server.')
 
 
 # ============================================================
@@ -963,8 +942,6 @@ if '📄 Single' in mode:
 | Scatter plots | `Plot A: (1,2), (3,4), (5,6). Plot B: (2,5), (4,8).` |
 
 **Color vs grayscale?** Add `grade 3-5` or `elementary` for color; `grade 6-8`/`grade 9-12` for grayscale.
-
-**AI parsing (optional, sidebar)** — off by default, free regex parser is used unless you turn it on and supply your own API key.
         """)
 
     st.markdown('---')
@@ -997,7 +974,7 @@ if '📄 Single' in mode:
         if placeholders and selected_idx is not None:
             debug_raw    = placeholders[selected_idx]['text']
             debug_prompt = PLACEHOLDER_PREFIX_RE.sub('', debug_raw).strip()
-            with st.expander('🔍 Debug: prompt extracted from document', expanded=True):
+            with st.expander('🔍 Details: text found in document', expanded=False):
                 st.code(debug_prompt or '(empty — nothing found after "Image (if any):")')
 
         st.subheader('3 — Paste Prompt')
@@ -1021,7 +998,6 @@ if '📄 Single' in mode:
                     try:
                         params, img_type, parse_method = parse_prompt(
                             prompt.strip(), use_ai=use_ai, ai_api_key=ai_api_key)
-                        st.info(f'Detected type: **{img_type}** · Parsed with: **{parse_method}**')
 
                         if img_type == 'too_short':
                             word_count = len(re.findall(r'\S+', prompt.strip()))
@@ -1057,10 +1033,6 @@ if '📄 Single' in mode:
                             uploaded.seek(0)
                             doc2 = Document(uploaded)
                             img_buf.seek(0)
-                            # doc2 is a fresh Document instance, so we must re-locate the
-                            # target paragraph inside it by index — the Paragraph object
-                            # stored against the original `doc_obj` belongs to a different
-                            # Document and can't be reused here.
                             doc2_placeholders = find_image_placeholders(doc2)
                             target_para = doc2_placeholders[selected_idx]['paragraph']
                             replace_placeholder(doc2, target_para, img_buf)
@@ -1098,12 +1070,12 @@ embeds graphs into each one, and lets you download all updated files in a single
 ### 🙋 If you're a teammate using an already-set-up app
 
 You don't need your own Google Cloud project or API key — just **share your Drive folder**
-with the service account shown in the sidebar (look for the green box with the email
+with the service account shown in the sidebar (look for the green "Connected" box
 once you select Batch mode). Steps:
 
 1. Open your Google Drive folder containing the `.docx` files.
 2. Click **Share**.
-3. Paste in the service account email shown in the sidebar (e.g. `something@project.iam.gserviceaccount.com`).
+3. Paste in the service account email shown in the sidebar.
 4. Set permission to **Editor**, then click Send/Share.
 5. Come back here, paste the folder link below, and click **Process All Documents**.
 
@@ -1115,8 +1087,8 @@ That's it — no credentials to manage on your end.
 
 1. Go to [Google Cloud Console](https://console.cloud.google.com) and enable the **Google Drive API**.
 2. Create a **Service Account** and download the JSON key file.
-3. Add it to the app's secrets as `GOOGLE_CREDS_JSON` (so it pre-fills for everyone automatically),
-   or paste it into the sidebar text box yourself.
+3. Add it to the app's secrets as `GOOGLE_CREDS_JSON` in Streamlit Cloud's app settings
+   (Settings → Secrets) — it will never be shown in the app's UI.
 4. Share any folder you want to process with that service account's email (Editor access).
 5. Anyone with access to this app can now use Batch mode on folders they've shared with that
    same service account — see the teammate instructions above.
@@ -1140,7 +1112,7 @@ The ZIP will contain:
     )
 
     show_batch_debug = st.checkbox(
-        '🔍 Show debug info (extracted prompts per document)',
+        '🔍 Show details (extracted prompts per document)',
         value=False,
         help='When checked, after processing you can expand each document to see exactly '
              'what prompt text was extracted from every placeholder, what type was detected, '
@@ -1148,9 +1120,12 @@ The ZIP will contain:
     )
 
     if st.button('🚀 Process All Documents', type='primary'):
-        creds_str = creds_input.strip() if 'creds_input' in dir() else ''
+        creds_str = get_google_creds_str().strip()
         if not creds_str:
-            st.error('Please paste your Service Account JSON in the sidebar on the left first.')
+            st.error(
+                'Google Drive isn\'t connected. Ask your admin to add the service '
+                'account credentials in the app settings before using Batch mode.'
+            )
             st.stop()
         if not folder_url.strip():
             st.error('Please enter a Google Drive folder link.')
@@ -1259,7 +1234,7 @@ The ZIP will contain:
         # ---- Batch debug view ----
         if show_batch_debug and debug_blocks:
             st.markdown('---')
-            st.subheader('🔍 Debug: prompts extracted per document')
+            st.subheader('🔍 Details: prompts extracted per document')
             for fname, results in debug_blocks:
                 with st.expander(f'📄 {fname}  —  {len(results)} placeholder(s)', expanded=False):
                     for i, r in enumerate(results):
