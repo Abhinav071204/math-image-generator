@@ -859,7 +859,7 @@ if '📄 Single' in mode:
                 options=range(len(placeholders)),
                 format_func=lambda i: f"[Para {placeholders[i]['para_index']}] {placeholders[i]['text'][:70]}..."
             )
-            if placeholders and selected_idx is not None:
+            # DEBUG: show exactly what text was extracted from the document
             debug_raw    = placeholders[selected_idx]['text']
             debug_prompt = re.sub(r'^image\s*\(if any\)\s*:\s*', '', debug_raw, flags=re.I).strip()
             with st.expander('🔍 Debug: prompt extracted from document', expanded=True):
