@@ -460,13 +460,35 @@ def parse_scatter_prompt(prompt):
     return params
 
 
+MIN_PROMPT_WORDS = 6  # prompts with 5 words or fewer are treated as "no real image requested"
+
+def is_too_short_to_be_a_graph_prompt(prompt):
+    """
+    Returns True if the prompt has 5 or fewer words — too short to plausibly
+    describe a graph (e.g. 'n/a', 'none', 'no image needed', 'TBD').
+    Prevents the AI/regex parsers from hallucinating a graph out of filler text.
+    """
+    if not prompt or not prompt.strip():
+        return True
+    words = re.findall(r'\S+', prompt.strip())
+    return len(words) <= 5
+
+
 def parse_prompt(prompt, use_ai=False, ai_api_key=None):
     """
     Default: free regex parser.
     If use_ai is True and a key is supplied, try AI parsing first;
     on any failure, silently fall back to the regex parser.
     Returns (params, img_type, parse_method).
+
+    Prompts with 5 words or fewer are rejected outright (returns None, 'too_short', '—')
+    since they're almost always placeholders like 'n/a', 'none', or 'not applicable'
+    rather than an actual graph description, and would otherwise cause the AI parser
+    to invent a graph from nothing.
     """
+    if is_too_short_to_be_a_graph_prompt(prompt):
+        return None, 'too_short', '—'
+
     if use_ai and ai_api_key:
         data, err = ai_parse_prompt(prompt, ai_api_key)
         if data:
@@ -683,6 +705,12 @@ def process_doc_bytes(doc_bytes, use_ai=False, ai_api_key=None):
             entry['error'] = 'Empty prompt'
             results.append(entry)
             continue
+        if is_too_short_to_be_a_graph_prompt(prompt):
+            entry['img_type']     = 'too_short'
+            entry['parse_method'] = '—'
+            entry['error']        = f'Skipped — prompt has 5 words or fewer ("{prompt}"), not treated as a graph request'
+            results.append(entry)
+            continue
         try:
             params, img_type, parse_method = parse_prompt(prompt, use_ai=use_ai, ai_api_key=ai_api_key)
             entry['img_type']     = img_type
@@ -891,7 +919,15 @@ if '📄 Single' in mode:
                             prompt.strip(), use_ai=use_ai, ai_api_key=ai_api_key)
                         st.info(f'Detected type: **{img_type}** · Parsed with: **{parse_method}**')
 
-                        if img_type == 'line_graph' and (not params or not params.get('lines')):
+                        if img_type == 'too_short':
+                            word_count = len(re.findall(r'\S+', prompt.strip()))
+                            st.warning(
+                                f'⏭️ This prompt is only **{word_count} word(s)** long — '
+                                'too short to be a real graph description (e.g. "n/a", "none", "TBD"). '
+                                'No image was generated. If this was meant to be a graph, please add more detail '
+                                '(an equation, coordinate points, or a description of the pattern).'
+                            )
+                        elif img_type == 'line_graph' and (not params or not params.get('lines')):
                             st.error(
                                 '⚠️ No lines found in your prompt.\n\n'
                                 'Make sure it includes either:\n'
@@ -1055,12 +1091,18 @@ The ZIP will contain:
                         except Exception as ue:
                             summary.append(f'  ⚠️ Drive update failed for **{fname}**: `{ue}`')
 
-                    ok  = sum(1 for r in results if r['img_buf'] and not r['error'])
-                    err = sum(1 for r in results if r['error'])
+                    ok         = sum(1 for r in results if r['img_buf'] and not r['error'])
+                    too_short  = sum(1 for r in results if r.get('img_type') == 'too_short')
+                    other_err  = sum(1 for r in results if r['error'] and r.get('img_type') != 'too_short')
                     drive_note = ' · ☁️ updated in Drive' if drive_saved else ''
+                    note_parts = []
+                    if too_short:
+                        note_parts.append(f'{too_short} skipped (too short, e.g. "n/a")')
+                    if other_err:
+                        note_parts.append(f'{other_err} skipped (prompt not recognised)')
                     summary.append(
                         f'✅ **{fname}** — {ok} graph(s) embedded{drive_note}'
-                        + (f', {err} skipped (prompt not recognised)' if err else '')
+                        + (', ' + ', '.join(note_parts) if note_parts else '')
                     )
                 except Exception as e:
                     summary.append(f'❌ **{fname}** — error: {e}')
