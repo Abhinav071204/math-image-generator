@@ -1,6 +1,5 @@
 import streamlit as st
-import anthropic, json
-import os, re, io, zipfile
+import os, re, json, io, zipfile
 from pathlib import Path
 import numpy as np
 import matplotlib
@@ -9,7 +8,6 @@ import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from docx import Document
 from docx.shared import Inches
-from lxml import etree
 
 
 # ============================================================
@@ -35,7 +33,7 @@ st.markdown("""
 STYLE_RULES = {
     'graphs': {
         'axis_pad_units'   : 0.5,
-        'line_width_pt'    : 1.5,   # thicker so lines are visible
+        'line_width_pt'    : 1.5,
         'gridline_width_pt': 0.5,
         'gridline_color'   : '#cccccc',
     },
@@ -44,7 +42,130 @@ GRAYSCALE_PATTERNS = ['-', '--', ':', '-.']
 COLOR_PALETTE      = ['blue', 'darkorange', 'green', 'red', 'purple']
 
 # ============================================================
-# PARSERS
+# OPTIONAL AI PARSING (off by default — costs money only if a key is supplied)
+# ============================================================
+AI_SYSTEM_PROMPT = """You convert a math-graph image prompt into STRICT JSON. Output ONLY valid JSON, no markdown fences, no commentary.
+
+Detect exactly one of two graph types and return ONLY the matching schema.
+
+TYPE "line_graph":
+{
+  "type": "line_graph",
+  "title": string or null,
+  "x_label": string,
+  "y_label": string,
+  "x_min": number, "x_max": number,
+  "y_min": number, "y_max": number,
+  "grade_band": "3-5" | "6-8" | "9-12" | null,
+  "lines": [
+    {"equation": string, "label": string or null, "point1": [x,y], "point2": [x,y], "style": "solid"|"dashed"|"dotted"}
+  ],
+  "intersection": [x, y] or null
+}
+
+TYPE "scatter_grid":
+{
+  "type": "scatter_grid",
+  "x_label": string, "y_label": string,
+  "x_min": number, "x_max": number, "y_min": number, "y_max": number,
+  "grade_band": "3-5" | "6-8" | "9-12" | null,
+  "plots": { "A": [[x,y],[x,y],...], "B": [...] }
+}
+
+Rules:
+- If axis range isn't stated, default x:-2 to 8, y:-2 to 8 for line_graph; 0 to 10 for scatter_grid.
+- grade_band: "grade 3-5"/"elementary" -> "3-5"; "grade 6-8"/"middle school" -> "6-8"; "grade 9-12"/"high school" -> "9-12". Otherwise null.
+- Do your best with incomplete prompts rather than failing."""
+
+
+def ai_parse_prompt(prompt, api_key):
+    """Returns (data_dict, error). Never raises — failures return (None, msg)
+    so callers can fall back to the free regex parser cleanly."""
+    try:
+        import anthropic
+    except ImportError:
+        return None, "anthropic package not installed"
+    if not api_key:
+        return None, "No API key provided"
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        resp = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=1500,
+            system=AI_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        text = resp.content[0].text.strip()
+        text = re.sub(r'^```(?:json)?\s*|\s*```$', '', text.strip())
+        return json.loads(text), None
+    except json.JSONDecodeError as e:
+        return None, f"Model did not return valid JSON: {e}"
+    except Exception as e:
+        return None, f"AI call failed: {e}"
+
+
+def normalize_ai_line_params(data):
+    grade_band = data.get('grade_band')
+    color_mode = resolve_color_mode(grade_band)
+    linestyle_map = {'solid': '-', 'dashed': '--', 'dotted': ':', 'dash-dot': '-.'}
+    lines_out = []
+    for line in data.get('lines', []):
+        p1, p2 = line.get('point1'), line.get('point2')
+        if not p1 or not p2:
+            continue
+        x1, y1 = p1
+        x2, y2 = p2
+        if x2 == x1:
+            slope, intercept = None, None
+        else:
+            slope = (y2 - y1) / (x2 - x1)
+            intercept = y1 - slope * x1
+        lines_out.append({
+            'equation'      : line.get('label') or line.get('equation') or 'line',
+            'slope'         : slope,
+            'intercept'     : intercept,
+            'points'        : [(x1, y1), (x2, y2)],
+            'linestyle'     : linestyle_map.get(line.get('style', 'solid'), '-'),
+            'style_explicit': True,
+        })
+    ds = get_dataset_styles(len(lines_out), color_mode)
+    for idx, line in enumerate(lines_out):
+        line['color'] = ds[idx][0]
+    intersection = data.get('intersection')
+    return {
+        'title'       : data.get('title') or '',
+        'x_label'     : data.get('x_label', 'x'),
+        'y_label'     : data.get('y_label', 'y'),
+        'x_min'       : data.get('x_min', -2),
+        'x_max'       : data.get('x_max', 8),
+        'y_min'       : data.get('y_min', -2),
+        'y_max'       : data.get('y_max', 8),
+        'lines'       : lines_out,
+        'intersection': tuple(intersection) if intersection else None,
+        'grade_band'  : grade_band,
+        'color_mode'  : color_mode,
+    }
+
+
+def normalize_ai_scatter_params(data):
+    grade_band = data.get('grade_band')
+    plots = {k: [tuple(pt) for pt in v] for k, v in data.get('plots', {}).items()}
+    return {
+        'x_label'   : data.get('x_label', 'x'),
+        'y_label'   : data.get('y_label', 'y'),
+        'x_min'     : data.get('x_min', 0),
+        'x_max'     : data.get('x_max', 10),
+        'y_min'     : data.get('y_min', 0),
+        'y_max'     : data.get('y_max', 10),
+        'plots'     : plots,
+        'grade_band': grade_band,
+        'color_mode': resolve_color_mode(grade_band),
+        'plot_descriptions': {},
+    }
+
+
+# ============================================================
+# REGEX PARSERS (always free, default path)
 # ============================================================
 _LOWER_WORDS = {'a','an','the','in','on','at','to','for','of','with','by','and','but','or','nor','so','yet'}
 
@@ -86,7 +207,6 @@ def resolve_font(grade_band):
 
 def detect_prompt_type(prompt):
     p = prompt.lower()
-    # Scatter: explicit keyword OR any "Plot X:" / "Plot X points" pattern
     if re.search(r'scatter|2x2|four\s+(scatter|plot)', p):
         return 'scatter_grid'
     if re.search(r'\bplot\s+[a-z0-9]\s*[:\-]|\bplot\s+[a-z0-9]\s+points?', p, re.I):
@@ -96,7 +216,6 @@ def detect_prompt_type(prompt):
     return 'unknown'
 
 def parse_line_prompt(prompt):
-    # Normalise dashes and unicode minus
     p = prompt
     for ch in ['−', '–', '—', '\u2212', '\u2013', '\u2014']:
         p = p.replace(ch, '-')
@@ -136,14 +255,8 @@ def parse_line_prompt(prompt):
         s = (y2 - y1) / (x2 - x1)
         return s, y1 - s * x1
 
-    # ----------------------------------------------------------------
-    # FIX 1: also parse equations like y = 2x + 1 directly,
-    # not just from coordinate pairs
-    # ----------------------------------------------------------------
     def parse_equation(text):
-        """Return (slope, intercept) from 'y = mx + b' style strings, or None."""
         text = text.replace(' ', '').lower()
-        # y = mx + b
         m = re.match(r'y=(-?\d*\.?\d*)x([+-]\d+\.?\d*)?$', text)
         if m:
             coef = m.group(1)
@@ -152,7 +265,6 @@ def parse_line_prompt(prompt):
             else:                   slope = float(coef)
             intercept = float(m.group(2)) if m.group(2) else 0.0
             return slope, intercept
-        # y = b  (horizontal line)
         m = re.match(r'y=(-?\d+\.?\d*)$', text)
         if m:
             return 0.0, float(m.group(1))
@@ -184,16 +296,13 @@ def parse_line_prompt(prompt):
         return m.group(1).lower() if m else None
 
     def extract_coord_pairs(block):
-        """Extract (x,y) pairs from both '(0,10)' and 'x=0, y=10' formats."""
         pairs = []
-        # Format 1: (x, y)
         for x, y in re.findall(r'\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)', block):
             pt = (float(x), float(y))
             if not pairs or pairs[-1] != pt:
                 pairs.append(pt)
         if pairs:
             return pairs
-        # Format 2: x=0, y=10 (one pair per "Point N:" line)
         for x, y in re.findall(r'x\s*=\s*(-?\d+(?:\.\d+)?)\D+?y\s*=\s*(-?\d+(?:\.\d+)?)', block, re.I):
             pt = (float(x), float(y))
             if not pairs or pairs[-1] != pt:
@@ -220,17 +329,14 @@ def parse_line_prompt(prompt):
                 'style_explicit': extract_style(block) is not None,
             })
         else:
-            # FIX 1b: fall back to equation parsing when fewer than 2 coord pairs
             eq_m = re.search(r'y\s*=\s*(-?\s*\d*\.?\d*\s*x\s*(?:[+\-]\s*\d+\.?\d*)?|-?\d+\.?\d*)', block, re.I)
             if eq_m:
                 result = parse_equation(eq_m.group(0))
                 if result:
                     sl, b = result
-                    # Generate two display points from the equation
-                    x_lo = params['x_min']
-                    x_hi = params['x_max']
-                    pt1  = (int(x_lo), int(sl*x_lo + b) if (sl*x_lo+b) == int(sl*x_lo+b) else sl*x_lo+b)
-                    pt2  = (int(x_hi), int(sl*x_hi + b) if (sl*x_hi+b) == int(sl*x_hi+b) else sl*x_hi+b)
+                    x_lo, x_hi = params['x_min'], params['x_max']
+                    pt1 = (int(x_lo), int(sl*x_lo+b) if (sl*x_lo+b) == int(sl*x_lo+b) else sl*x_lo+b)
+                    pt2 = (int(x_hi), int(sl*x_hi+b) if (sl*x_hi+b) == int(sl*x_hi+b) else sl*x_hi+b)
                     lines_found.append({
                         'equation'      : s_name if s_name else eq_m.group(0).strip(),
                         'slope'         : sl,
@@ -257,7 +363,6 @@ def parse_line_prompt(prompt):
 
 
 def _synthesise_scatter_points(description, x_min, x_max, y_min, y_max, seed=42):
-    """Generate plausible scatter points from a text description."""
     import random
     rng = random.Random(seed)
     n   = 10
@@ -282,7 +387,6 @@ def _synthesise_scatter_points(description, x_min, x_max, y_min, y_max, seed=42)
 
 
 def _extract_axis_labels_from_intro(text):
-    """Pull axis labels from intro sentence like 'plots showing seashell length and mass'."""
     m = re.search(
         r'scatter\s+plots?\s+(?:showing|of|for|comparing)\s+'
         r'([a-z][a-z\s]+?)\s+and\s+([a-z][a-z\s]+?)[\.,]',
@@ -303,25 +407,7 @@ def parse_scatter_prompt(prompt):
         'color_mode': resolve_color_mode(grade_band),
         'plot_descriptions': {},
     }
-    
 
-def parse_with_ai(prompt, img_type_hint=None):
-    client = anthropic.Anthropic()
-    resp = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1000,
-        messages=[{
-            "role": "user",
-            "content": f"""Extract graph data from this prompt as JSON only, no prose.
-Schema: {{"type":"line_graph"|"scatter_grid","title":str,"x_label":str,"y_label":str,
-"x_min":num,"x_max":num,"y_min":num,"y_max":num,
-"lines":[{{"name":str,"points":[[x,y],[x,y]],"style":"solid"|"dashed"|"dotted"}}],
-"intersection":[x,y]|null}}
-
-Prompt: {prompt}"""
-        }]
-    )
-    return json.loads(resp.content[0].text)
     xl = re.search(r'(?:x-axis|horizontal\s+axis)\s*(?:labeled?|as)?\s*"([^"]+)"', p, re.I)
     yl = re.search(r'(?:y-axis|vertical\s+axis)\s*(?:labeled?|as)?\s*"([^"]+)"', p, re.I)
     if xl: params['x_label'] = to_sentence_case(xl.group(1))
@@ -348,14 +434,12 @@ Prompt: {prompt}"""
         end   = plot_starts[i + 1][1] if i + 1 < len(plot_starts) else len(p)
         block = p[start:end]
 
-        # 1st: explicit (x,y) pairs
         paren_pts = re.findall(r'\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)', block)
         if paren_pts:
             pts = [(float(x), float(y)) for x, y in paren_pts]
             plots[label] = [(int(x) if x == int(x) else x, int(y) if y == int(y) else y) for x, y in pts]
             continue
 
-        # 2nd: flat number list
         m_pts = re.search(r'points?\s+([\d.,\s\-]+)', block, re.I)
         if m_pts:
             nums = [float(n) for n in re.findall(r'-?\d+(?:\.\d+)?', m_pts.group(1))]
@@ -364,14 +448,10 @@ Prompt: {prompt}"""
                 plots[label] = [(int(x) if x == int(x) else x, int(y) if y == int(y) else y) for x, y in pts]
                 continue
 
-        # 3rd: synthesise from description text
         desc = re.sub(r'^Plot\s+[A-Za-z0-9]\s+shows?\s+points?\s*[—\-]*\s*', '', block, flags=re.I).strip()
         descriptions[label] = desc
         pts = _synthesise_scatter_points(
-            desc,
-            params['x_min'], params['x_max'],
-            params['y_min'], params['y_max'],
-            seed=ord(label)
+            desc, params['x_min'], params['x_max'], params['y_min'], params['y_max'], seed=ord(label)
         )
         plots[label] = pts
 
@@ -380,13 +460,29 @@ Prompt: {prompt}"""
     return params
 
 
-def parse_prompt(prompt):
+def parse_prompt(prompt, use_ai=False, ai_api_key=None):
+    """
+    Default: free regex parser.
+    If use_ai is True and a key is supplied, try AI parsing first;
+    on any failure, silently fall back to the regex parser.
+    Returns (params, img_type, parse_method).
+    """
+    if use_ai and ai_api_key:
+        data, err = ai_parse_prompt(prompt, ai_api_key)
+        if data:
+            img_type = data.get('type')
+            if img_type == 'line_graph':
+                return normalize_ai_line_params(data), img_type, 'AI'
+            elif img_type == 'scatter_grid':
+                return normalize_ai_scatter_params(data), img_type, 'AI'
+        # fall through to regex on any failure
+
     img_type = detect_prompt_type(prompt)
     if img_type == 'line_graph':
-        return parse_line_prompt(prompt), img_type
+        return parse_line_prompt(prompt), img_type, 'rule-based (free)'
     elif img_type == 'scatter_grid':
-        return parse_scatter_prompt(prompt), img_type
-    return None, img_type
+        return parse_scatter_prompt(prompt), img_type, 'rule-based (free)'
+    return None, img_type, 'rule-based (free)'
 
 
 # ============================================================
@@ -431,10 +527,8 @@ def generate_line_image(params):
     for idx, line in enumerate(params['lines']):
         if line['slope'] is None: continue
         y_vals = line['slope'] * x_full + line['intercept']
-        # FIX: clip y values to plot range so lines extend fully across the axes
         mask   = (y_vals >= yp_min) & (y_vals <= yp_max)
-        ax.plot(x_full[mask], y_vals[mask],
-                color=line['color'],
+        ax.plot(x_full[mask], y_vals[mask], color=line['color'],
                 linewidth=STYLE_RULES['graphs']['line_width_pt'],
                 linestyle=line['linestyle'], label=line['equation'], zorder=2)
         for pidx, (xi, yi) in enumerate(line['points']):
@@ -488,7 +582,6 @@ def generate_scatter_grid(params):
         xs = [p[0] for p in points]
         ys = [p[1] for p in points]
         color = style[0] if color_mode == 'color' else 'black'
-        # FIX 2b: use visible markers with clear borders
         ax.scatter(xs, ys, color=color, marker='o', s=60,
                    edgecolors='black' if color_mode != 'color' else color,
                    linewidths=0.8, zorder=3)
@@ -521,7 +614,7 @@ def render_image(params, img_type):
 
 
 # ============================================================
-# DOCX HELPERS — FIX 3: robust placeholder replacement
+# DOCX HELPERS
 # ============================================================
 def extract_full_text(para):
     parts = []
@@ -544,11 +637,8 @@ def find_image_placeholders(doc):
     return found
 
 def replace_placeholder(doc, para_index, img_bytes):
-    """
-    FIX 3: Completely replace the target paragraph's XML with a fresh <w:p>
-    containing only the image run.  This avoids left-over runs and broken
-    element trees that occurred when we tried to mutate the paragraph in-place.
-    """
+    """Replace the target paragraph's XML with a fresh <w:p> containing only
+    the image run — avoids leftover runs / broken element trees."""
     from docx.oxml.ns import qn
     from docx.oxml   import OxmlElement
     from copy        import deepcopy
@@ -556,39 +646,30 @@ def replace_placeholder(doc, para_index, img_bytes):
     para   = doc.paragraphs[para_index]
     p_elem = para._element
 
-    # Save paragraph properties (pPr) if present
     pPr = p_elem.find(qn('w:pPr'))
     pPr_copy = deepcopy(pPr) if pPr is not None else None
 
-    # Build a brand-new <w:p> element
     new_p = OxmlElement('w:p')
     if pPr_copy is not None:
         new_p.append(pPr_copy)
 
-    # Create a run and embed the picture
     new_r = OxmlElement('w:r')
     new_p.append(new_r)
 
-    # Use python-docx's internal picture machinery on a temp paragraph,
-    # then steal the drawing XML from it
-    tmp_para = doc.add_paragraph()           # appended at end of doc
+    tmp_para = doc.add_paragraph()
     tmp_run  = tmp_para.add_run()
     img_bytes.seek(0)
     tmp_run.add_picture(img_bytes, width=Inches(5.5))
 
-    # The drawing element is inside the run of tmp_para
     drawing = tmp_para._element.find('.//' + qn('w:drawing'))
     if drawing is not None:
         new_r.append(deepcopy(drawing))
 
-    # Remove the temporary paragraph we used as a staging area
     tmp_para._element.getparent().remove(tmp_para._element)
-
-    # Replace the old paragraph element in the document body
     p_elem.getparent().replace(p_elem, new_p)
 
 
-def process_doc_bytes(doc_bytes):
+def process_doc_bytes(doc_bytes, use_ai=False, ai_api_key=None):
     """Process a .docx bytes blob. Returns (updated_doc_bytes, results_list)."""
     doc          = Document(io.BytesIO(doc_bytes))
     placeholders = find_image_placeholders(doc)
@@ -597,14 +678,15 @@ def process_doc_bytes(doc_bytes):
         raw    = ph['text']
         prompt = re.sub(r'^image\s*\(if any\)\s*:\s*', '', raw, flags=re.I).strip()
         entry  = {'placeholder': raw, 'para_index': ph['para_index'],
-                  'img_type': None, 'img_buf': None, 'error': None}
+                  'img_type': None, 'parse_method': None, 'img_buf': None, 'error': None}
         if not prompt:
             entry['error'] = 'Empty prompt'
             results.append(entry)
             continue
         try:
-            params, img_type = parse_prompt(prompt)
-            entry['img_type'] = img_type
+            params, img_type, parse_method = parse_prompt(prompt, use_ai=use_ai, ai_api_key=ai_api_key)
+            entry['img_type']     = img_type
+            entry['parse_method'] = parse_method
             if img_type not in ('line_graph', 'scatter_grid'):
                 entry['error'] = 'Could not detect graph type'
                 results.append(entry)
@@ -614,8 +696,7 @@ def process_doc_bytes(doc_bytes):
             entry['error'] = str(e)
         results.append(entry)
 
-    # Embed images — process in REVERSE index order so replacements don't
-    # shift the paragraph indices of later items
+    # Embed in reverse paragraph order so earlier replacements don't shift later indices
     for r in sorted(results, key=lambda x: x['para_index'], reverse=True):
         if r['img_buf'] and not r['error']:
             r['img_buf'].seek(0)
@@ -662,19 +743,12 @@ def download_drive_file(service, file_id):
     return buf.read()
 
 def update_drive_file(service, file_id, data, mime):
-    """
-    Update an EXISTING Drive file in-place.
-    Service accounts have no storage quota for CREATE, but can UPDATE
-    files they already have Editor access to (the quota belongs to the
-    file owner, not the service account).
-    """
+    """Update an EXISTING Drive file in-place — uses the file owner's quota,
+    not the service account's (which has none), so this avoids the
+    storageQuotaExceeded error on CREATE."""
     from googleapiclient.http import MediaIoBaseUpload
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime)
-    f = service.files().update(
-        fileId=file_id,
-        media_body=media,
-        fields='id,webViewLink'
-    ).execute()
+    f = service.files().update(fileId=file_id, media_body=media, fields='id,webViewLink').execute()
     return f.get('webViewLink', '')
 
 
@@ -685,6 +759,26 @@ with st.sidebar:
     st.title('⚙️ Settings')
     st.markdown('---')
     mode = st.radio('**Mode**', ['📄 Single Document', '📁 Batch (Google Drive)'])
+
+    st.markdown('---')
+    st.markdown('**Prompt Parsing**')
+    use_ai = st.checkbox(
+        '🤖 Use AI parsing (optional, costs money)',
+        value=False,
+        help='Off by default. The free rule-based parser handles most prompts. '
+             'Only enable this if you have your own Anthropic API key and want '
+             'extra-flexible prompt understanding.'
+    )
+    ai_api_key = None
+    if use_ai:
+        default_key = ''
+        try: default_key = st.secrets.get('ANTHROPIC_API_KEY', '')
+        except Exception: pass
+        ai_api_key = st.text_input(
+            'Anthropic API Key', value=default_key, type='password',
+            help='Your own key from console.anthropic.com — billed to you, pay-as-you-go.'
+        )
+        st.caption('⚠️ This uses your API credits. Falls back to the free parser automatically if it fails.')
 
     if 'Batch' in mode:
         st.markdown('---')
@@ -701,7 +795,7 @@ with st.sidebar:
         st.caption('🔒 Never stored or logged.')
 
     st.markdown('---')
-    st.caption('Graph generation runs entirely on the server — free, no external APIs.')
+    st.caption('Graph generation always runs free on the server. AI parsing is optional and off by default.')
 
 
 # ============================================================
@@ -710,7 +804,6 @@ with st.sidebar:
 if '📄 Single' in mode:
     st.title('📐 Math Image Generator')
 
-    # ---- Plain-English How-To ----
     with st.expander('📖 How to use this app (click to open)', expanded=False):
         st.markdown("""
 **Step-by-step guide:**
@@ -723,16 +816,10 @@ if '📄 Single' in mode:
    - Example: `Image (if any): the line y = 2x + 1, passing through (0,1) and (2,5)`
 
 2. **Upload your document** using the "Upload .docx" button below.
-
-3. **Select the placeholder** — the app will detect all `Image (if any):` lines and list them in a dropdown.
-
-4. **Paste your graph description** into the "Image prompt" box (you can copy it from the document).
-
+3. **Select the placeholder** — the app detects all `Image (if any):` lines.
+4. **Paste your graph description** into the "Image prompt" box.
 5. **Click "Generate Image"** — a preview appears on the right.
-
-6. **Download** either:
-   - Just the image (PNG file), or
-   - The full updated document (with the image embedded in place of the placeholder)
+6. **Download** the image (PNG) or the full updated document.
 
 ---
 **What kinds of graphs work?**
@@ -743,7 +830,9 @@ if '📄 Single' in mode:
 | Multiple lines | `Line A: (0,1) and (2,5) (solid). Line B: (0,3) and (4,3) (dashed).` |
 | Scatter plots | `Plot A: (1,2), (3,4), (5,6). Plot B: (2,5), (4,8).` |
 
-**Color vs grayscale?** Add `grade 3-5` or `elementary` in your prompt for color; `grade 6-8` or `grade 9-12` for grayscale.
+**Color vs grayscale?** Add `grade 3-5` or `elementary` for color; `grade 6-8`/`grade 9-12` for grayscale.
+
+**AI parsing (optional, sidebar)** — off by default, free regex parser is used unless you turn it on and supply your own API key.
         """)
 
     st.markdown('---')
@@ -792,8 +881,9 @@ if '📄 Single' in mode:
             else:
                 with st.spinner('Generating…'):
                     try:
-                        params, img_type = parse_prompt(prompt.strip())
-                        st.info(f'Detected type: **{img_type}**')
+                        params, img_type, parse_method = parse_prompt(
+                            prompt.strip(), use_ai=use_ai, ai_api_key=ai_api_key)
+                        st.info(f'Detected type: **{img_type}** · Parsed with: **{parse_method}**')
 
                         if img_type == 'line_graph' and (not params or not params.get('lines')):
                             st.error(
@@ -817,7 +907,6 @@ if '📄 Single' in mode:
                             img_buf = render_image(params, img_type)
                             st.image(img_buf, caption='Generated graph', use_container_width=True)
 
-                            # Build updated doc
                             img_buf.seek(0)
                             uploaded.seek(0)
                             doc2 = Document(uploaded)
@@ -905,7 +994,6 @@ The ZIP will contain:
 
         st.success(f'Found **{len(files)}** document(s). Processing…')
 
-        # Option: save back to Drive by updating the original file in-place
         upload_back = st.checkbox(
             '☁️ Also save updated files back to Google Drive '
             '(replaces the original .docx in-place — no storage quota needed)',
@@ -927,21 +1015,20 @@ The ZIP will contain:
                 status.markdown(f'⏳ Working on **{fname}** ({idx+1} of {len(files)})…')
                 try:
                     doc_bytes = download_drive_file(service, file_id)
-                    updated_bytes, results = process_doc_bytes(doc_bytes)
+                    updated_bytes, results = process_doc_bytes(
+                        doc_bytes, use_ai=use_ai, ai_api_key=ai_api_key)
 
                     if not results:
                         summary.append(f'⚠️ **{fname}** — no placeholders found, skipped')
                         progress.progress((idx+1)/len(files))
                         continue
 
-                    # Always add to ZIP
                     zf.writestr(f'Updated_Docs/{fname}', updated_bytes)
                     for r_idx, r in enumerate(results):
                         if r['img_buf'] and not r['error']:
                             r['img_buf'].seek(0)
                             zf.writestr(f'Images/{stem}_image_{r_idx+1}.png', r['img_buf'].read())
 
-                    # Update the ORIGINAL file in Drive in-place (uses owner quota, not SA quota)
                     drive_saved = False
                     if upload_back:
                         try:
