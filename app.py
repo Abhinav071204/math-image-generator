@@ -910,6 +910,22 @@ with st.sidebar:
         )
         st.caption('🔒 Never stored or logged.')
 
+        # Surface the service-account email so coworkers can copy/paste it
+        # straight into Google Drive's Share dialog without needing to open
+        # the JSON file themselves.
+        sa_email = None
+        if creds_input.strip():
+            try:
+                sa_email = json.loads(creds_input).get('client_email')
+            except Exception:
+                sa_email = None
+        if sa_email:
+            st.success(f'📧 Service account: `{sa_email}`')
+            st.caption(
+                'Share your Google Drive folder with this email (Editor access) '
+                'before running Batch mode — see the "How to use Batch Mode" guide above.'
+            )
+
     st.markdown('---')
     st.caption('Graph generation always runs free on the server. AI parsing is optional and off by default.')
 
@@ -1077,16 +1093,40 @@ else:
 **What this does:** Automatically processes an entire folder of Word documents from Google Drive,
 embeds graphs into each one, and lets you download all updated files in a single ZIP file.
 
-**Setup (one-time):**
+---
+
+### 🙋 If you're a teammate using an already-set-up app
+
+You don't need your own Google Cloud project or API key — just **share your Drive folder**
+with the service account shown in the sidebar (look for the green box with the email
+once you select Batch mode). Steps:
+
+1. Open your Google Drive folder containing the `.docx` files.
+2. Click **Share**.
+3. Paste in the service account email shown in the sidebar (e.g. `something@project.iam.gserviceaccount.com`).
+4. Set permission to **Editor**, then click Send/Share.
+5. Come back here, paste the folder link below, and click **Process All Documents**.
+
+That's it — no credentials to manage on your end.
+
+---
+
+### 🛠️ If you're setting this up for the first time (admin)
+
 1. Go to [Google Cloud Console](https://console.cloud.google.com) and enable the **Google Drive API**.
 2. Create a **Service Account** and download the JSON key file.
-3. **Share your Drive folder** with the service account email (give it **Editor** access).
-4. Paste the JSON key contents into the sidebar on the left.
+3. Add it to the app's secrets as `GOOGLE_CREDS_JSON` (so it pre-fills for everyone automatically),
+   or paste it into the sidebar text box yourself.
+4. Share any folder you want to process with that service account's email (Editor access).
+5. Anyone with access to this app can now use Batch mode on folders they've shared with that
+   same service account — see the teammate instructions above.
 
-**Then:**
+---
+
+**Then, for everyone:**
 1. Paste your Google Drive folder link below.
 2. Click **Process All Documents**.
-3. Wait for processing to finish, then download the ZIP file.
+3. Wait for processing to finish, then download the ZIP file (and/or have the originals updated in-place in Drive).
 
 The ZIP will contain:
 - All updated `.docx` files (with graphs embedded)
